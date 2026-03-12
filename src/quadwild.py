@@ -24,21 +24,15 @@ Dependencies
 
 from __future__ import annotations
 
+import logging
 import math
-import os
+import multiprocessing
 import platform
 import shutil
+import sys
 import tempfile
 from ctypes import (
-    POINTER,
-    Structure,
-    byref,
-    c_bool,
-    c_char_p,
-    c_double,
-    c_float,
-    c_int,
-    cdll,
+    POINTER, Structure, byref, c_bool, c_char_p, c_double, c_float, c_int, cdll,
 )
 from os import path
 from pathlib import Path
@@ -46,6 +40,8 @@ from typing import List, Optional, Union
 
 import numpy as np
 import trimesh
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +190,7 @@ class QuadWild:
         # ── Stage-1 (remeshAndField) ────────────────────────────────
         enable_preprocess: bool = True,
         enable_sharp: bool = True,
-        sharp_angle: float = 35.0,
+        sharp_angle: float = 45.0,
         # ── Stage-3 (quadPatches) ───────────────────────────────────
         enable_smoothing: bool = True,
         scale_factor: float = 1.0,
@@ -219,10 +215,12 @@ class QuadWild:
         hard_parity_constraint: bool = True,
         # Solver config presets
         flow_config: str = "SIMPLE",
-        satsuma_config: str = "DEFAULT",
+        satsuma_config: str = "LEMON",
         # Callback schedule (8-element lists; defaults are used when None)
         callback_time_limit: Optional[List[float]] = None,
         callback_gap_limit: Optional[List[float]] = None,
+        # Diagnostics
+        debug_dir: Optional[Union[str, Path]] = None,
     ) -> "trimesh.Scene":
         """Run the full QuadWild + Bi-MDF quad-remeshing pipeline.
 
@@ -285,6 +283,45 @@ class QuadWild:
         callback_gap_limit:
             8-element list of gap thresholds corresponding to each callback
             checkpoint.  Uses a sensible default when *None*.
+        debug_dir:
+            Optional path to a directory where **all intermediate pipeline
+            files** are copied after each stage, keeping their original names.
+            The directory is created if it does not exist.  Enabling this also
+            activates verbose ``logging.DEBUG`` output on the ``quadwild``
+            logger (name = ``__name__``).
+
+            Files saved (when they exist)::
+
+                00_input.obj               — mesh sent to remeshAndField2
+                01_sharp.sharp             — sharp-feature file
+                02_remeshed.obj            — output of remeshAndField2
+                03_traced.obj              — output of trace2
+                04_quadrangulation.obj     — raw quadrangulation
+                05_quadrangulation_smooth.obj — after Laplacian smoothing
+
+            Known differences vs. QRemeshify (Blender addon)
+            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            Comparing these debug files with the corresponding files saved by
+            QRemeshify can pinpoint why results diverge:
+
+            * **Triangulation**: QRemeshify calls ``bmesh.ops.triangulate``
+              (SHORT_EDGE / BEAUTY) before export.  This wrapper does *not*
+              explicitly triangulate — it relies on the input mesh already
+              being triangular.  Non-triangular input will produce different
+              or broken ``remeshAndField2`` results.
+            * **Sharp-edge sources**: QRemeshify marks edges as sharp when
+              they are a dihedral crease, boundary, *UV seam*, *material
+              boundary*, or *sculpt face-set boundary*.  This wrapper only
+              uses dihedral angle and boundary.  The ``01_sharp.sharp`` file
+              will therefore typically contain fewer entries than Blender's.
+            * **Mesh cleanup**: vertex merging, degenerate-face removal, and
+              normal fixes are currently commented out in ``_prepare_mesh``.
+              Blender's bmesh always produces a clean, consistently-wound mesh.
+            * **Coordinate space**: QRemeshify strips the object's translation
+              (applies only rotation + scale) so the mesh is centred near the
+              origin.  This wrapper processes the mesh in whatever space it
+              was loaded in; large translations can cause floating-point
+              precision issues inside the C++ solver.
 
         Returns
         -------
@@ -306,12 +343,38 @@ class QuadWild:
         if satsuma_config not in _SATSUMA_CONFIGS:
             raise ValueError(f"satsuma_config must be one of {list(_SATSUMA_CONFIGS)}, got {satsuma_config!r}")
 
+        dbg = debug_dir is not None
+        if dbg:
+            debug_dir = Path(debug_dir)
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
         scene  = self._to_scene(mesh)
-        merged = self._merge_scene(scene)
+        merged = self._to_mesh(scene)
+
+        # Detect UV seam edges *before* vertex merge collapses them.
+        pre_merge_boundary = self._get_boundary(merged) if enable_sharp else set()
+
         merged = self._prepare_mesh(merged)
+
+        log.debug(
+            "[stage 0 / input]  vertices=%d  faces=%d  watertight=%s",
+            len(merged.vertices), len(merged.faces), merged.is_watertight,
+        )
 
         if target_quad_count is not None and target_quad_count > 0:
             scale_factor = self._estimate_scale_factor(merged, target_quad_count)
+            log.debug(
+                "[stage 0 / input]  target_quad_count=%d → scale_factor=%.4f",
+                target_quad_count, scale_factor,
+            )
+
+        log.debug(
+            "[stage 0 / params]  enable_preprocess=%s  enable_sharp=%s  "
+            "sharp_angle=%.1f  enable_smoothing=%s  scale_factor=%.4f  "
+            "ilp_method=%s  alpha=%.4f  time_limit=%d  flow_config=%s  satsuma_config=%s",
+            enable_preprocess, enable_sharp, sharp_angle, enable_smoothing,
+            scale_factor, ilp_method, alpha, time_limit, flow_config, satsuma_config,
+        )
 
         cb_time = callback_time_limit or [3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0]
         cb_gap  = callback_gap_limit  or [0.005, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.3]
@@ -329,57 +392,130 @@ class QuadWild:
             out_smooth    = base + "_rem_p0_0_quadrangulation_smooth.obj"
 
             self._export_obj(merged, obj_path)
+            log.debug("[stage 0 / export]  wrote input OBJ → %s", obj_path)
+            if dbg:
+                shutil.copy2(obj_path, debug_dir / "00_input.obj")
 
             if enable_sharp:
-                n_features = self._export_sharp(merged, sharp_path, sharp_angle)
+                n_features = self._export_sharp(
+                    merged, sharp_path, sharp_angle,
+                    pre_merge_boundary_positions=pre_merge_boundary,
+                )
+                log.debug(
+                    "[stage 0 / sharp]  sharp edges written = %d  (angle threshold = %.1f°)",
+                    n_features, sharp_angle,
+                )
+                if dbg:
+                    shutil.copy2(sharp_path, debug_dir / "01_sharp.sharp")
             else:
                 n_features = 0
+                log.debug("[stage 0 / sharp]  sharp detection disabled")
 
-            self._call_remesh_and_field(
-                obj_path=obj_path,
-                sharp_path=sharp_path,
-                field_path=field_path,
-                enable_preprocess=enable_preprocess,
-                enable_sharp=enable_sharp and n_features > 0,
-                sharp_angle=sharp_angle,
-            )
+            # ── Run C++ stages in a subprocess so a C++ crash (SIGABRT / SIGSEGV)
+            # ── cannot kill the Python process. The child inherits all ctypes
+            # ── library handles via fork and writes results to the shared tmpdir.
+            error_file = path.join(tmpdir, "_error.txt")
 
-            self._call_trace(remeshed_base)
+            def _cpp_worker():
+                try:
+                    self._call_remesh_and_field(
+                        obj_path=obj_path,
+                        sharp_path=sharp_path,
+                        field_path=field_path,
+                        enable_preprocess=enable_preprocess,
+                        enable_sharp=enable_sharp and n_features > 0,
+                        sharp_angle=sharp_angle,
+                    )
+                    self._call_trace(remeshed_base)
+                    self._call_quadrangulate(
+                        traced_path=traced_path,
+                        enable_smoothing=enable_smoothing,
+                        scale_factor=scale_factor,
+                        fixed_chart_clusters=fixed_chart_clusters,
+                        alpha=alpha,
+                        ilp_method=ilp_method,
+                        time_limit=time_limit,
+                        gap_limit=gap_limit,
+                        minimum_gap=minimum_gap,
+                        isometry=isometry,
+                        regularity_quads=regularity_quads,
+                        regularity_non_quads=regularity_non_quads,
+                        regularity_non_quads_weight=regularity_non_quads_weight,
+                        align_singularities=align_singularities,
+                        align_singularities_weight=align_singularities_weight,
+                        repeat_losing_iterations=repeat_losing_iterations,
+                        repeat_losing_quads=repeat_losing_quads,
+                        repeat_losing_non_quads=repeat_losing_non_quads,
+                        repeat_losing_align=repeat_losing_align,
+                        hard_parity_constraint=hard_parity_constraint,
+                        flow_config=flow_config,
+                        satsuma_config=satsuma_config,
+                        callback_time_limit=cb_time,
+                        callback_gap_limit=cb_gap,
+                    )
+                except Exception as exc:
+                    try:
+                        with open(error_file, "w") as _f:
+                            _f.write(str(exc))
+                    except OSError:
+                        pass
+                    sys.exit(1)
 
-            self._call_quadrangulate(
-                traced_path=traced_path,
-                enable_smoothing=enable_smoothing,
-                scale_factor=scale_factor,
-                fixed_chart_clusters=fixed_chart_clusters,
-                alpha=alpha,
-                ilp_method=ilp_method,
-                time_limit=time_limit,
-                gap_limit=gap_limit,
-                minimum_gap=minimum_gap,
-                isometry=isometry,
-                regularity_quads=regularity_quads,
-                regularity_non_quads=regularity_non_quads,
-                regularity_non_quads_weight=regularity_non_quads_weight,
-                align_singularities=align_singularities,
-                align_singularities_weight=align_singularities_weight,
-                repeat_losing_iterations=repeat_losing_iterations,
-                repeat_losing_quads=repeat_losing_quads,
-                repeat_losing_non_quads=repeat_losing_non_quads,
-                repeat_losing_align=repeat_losing_align,
-                hard_parity_constraint=hard_parity_constraint,
-                flow_config=flow_config,
-                satsuma_config=satsuma_config,
-                callback_time_limit=cb_time,
-                callback_gap_limit=cb_gap,
-            )
+            log.debug("[stages 1–3]  running C++ pipeline in subprocess …")
+            proc = multiprocessing.Process(target=_cpp_worker, daemon=True)
+            proc.start()
+            proc.join(timeout=time_limit + 120)
+
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(5)
+                raise QuadWildError(f"Pipeline timed out (>{time_limit + 120}s)")
+            if proc.exitcode != 0:
+                err_msg = (
+                    Path(error_file).read_text().strip()
+                    if path.isfile(error_file)
+                    else f"C++ pipeline failed or crashed (exitcode={proc.exitcode})"
+                )
+                raise QuadWildError(err_msg)
+
+            log.debug("[stages 1–3 / done]")
+
+            remeshed_path = remeshed_base + ".obj"
+            if path.isfile(remeshed_path):
+                rem = self._import_obj(remeshed_path)
+                log.debug(
+                    "[stage 1]  remeshed mesh: vertices=%d  faces=%d",
+                    len(rem.vertices), len(rem.faces),
+                )
+                if dbg:
+                    shutil.copy2(remeshed_path, debug_dir / "02_remeshed.obj")
+            if path.isfile(traced_path):
+                tr = self._import_obj(traced_path)
+                log.debug(
+                    "[stage 2]  traced mesh:   vertices=%d  faces=%d",
+                    len(tr.vertices), len(tr.faces),
+                )
+                if dbg:
+                    shutil.copy2(traced_path, debug_dir / "03_traced.obj")
+            if path.isfile(out_path) and dbg:
+                shutil.copy2(out_path, debug_dir / "04_quadrangulation.obj")
+            if path.isfile(out_smooth) and dbg:
+                shutil.copy2(out_smooth, debug_dir / "05_quadrangulation_smooth.obj")
 
             result_path = out_smooth if (enable_smoothing and path.isfile(out_smooth)) else out_path
             result_mesh = self._import_obj(result_path)
+            log.debug(
+                "[stage 3 / done]   result mesh:   vertices=%d  faces=%d  smoothed=%s",
+                len(result_mesh.vertices), len(result_mesh.faces),
+                enable_smoothing and path.isfile(out_smooth),
+            )
 
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         self._recompute_smooth_normals(result_mesh)
+        if dbg:
+            log.debug("[debug]  intermediate files saved to %s", debug_dir)
 
         return trimesh.Scene({"mesh": result_mesh})
 
@@ -408,24 +544,18 @@ class QuadWild:
     # ------------------------------------------------------------------
 
     def _load_libs(self):
-        system = platform.system()
-        if system == "Windows":
-            qw_name = "lib_quadwild.dll"
-            qp_name = "lib_quadpatches.dll"
-        elif system == "Darwin":
-            qw_name = "liblib_quadwild.dylib"
-            qp_name = "liblib_quadpatches.dylib"
-        else:
-            qw_name = "liblib_quadwild.so"
-            qp_name = "liblib_quadpatches.so"
+        _LIB_NAMES = {
+            "Windows": ("lib_quadwild.dll", "lib_quadpatches.dll"),
+            "Darwin":  ("liblib_quadwild.dylib", "liblib_quadpatches.dylib"),
+        }
+        qw_name, qp_name = _LIB_NAMES.get(
+            platform.system(), ("liblib_quadwild.so", "liblib_quadpatches.so"),
+        )
+        qw_path, qp_path = (str(self._libs_dir / n) for n in (qw_name, qp_name))
 
-        qw_path = str(self._libs_dir / qw_name)
-        qp_path = str(self._libs_dir / qp_name)
-
-        if not path.isfile(qw_path):
-            raise QuadWildError(f"QuadWild library not found: {qw_path}")
-        if not path.isfile(qp_path):
-            raise QuadWildError(f"QuadPatches library not found: {qp_path}")
+        for lib_path in (qw_path, qp_path):
+            if not path.isfile(lib_path):
+                raise QuadWildError(f"Library not found: {lib_path}")
 
         qw = cdll.LoadLibrary(qw_path)
         qp = cdll.LoadLibrary(qp_path)
@@ -454,7 +584,7 @@ class QuadWild:
             return trimesh.Scene({"mesh": loaded})
         return loaded
 
-    def _merge_scene(self, scene: "trimesh.Scene") -> "trimesh.Trimesh":
+    def _to_mesh(self, scene: "trimesh.Scene") -> "trimesh.Trimesh":
         """Concatenate every Trimesh geometry in the scene into one mesh."""
         meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not meshes:
@@ -481,6 +611,31 @@ class QuadWild:
         sf = math.sqrt(f_in / (2.0 * target_quad_count))
         return max(0.01, min(10.0, sf))
 
+    def _get_boundary(self, mesh: "trimesh.Trimesh") -> set:
+        """Return geometric positions of all boundary edges as ``frozenset`` pairs.
+
+        On a mesh loaded from a UV-mapped format (OBJ, glTF, …), trimesh
+        splits vertices at UV seams.  Those seam edges appear as boundary
+        edges here.  After a subsequent position-based ``merge_vertices``,
+        UV seam edges become interior edges while real geometric boundaries
+        remain.  Comparing the result of this method (called *before* merge)
+        with the post-merge ``face_adjacency`` allows us to identify UV seams.
+
+        Each element is ``frozenset((pos0_tuple, pos1_tuple))`` with positions
+        rounded to 6 decimal places.
+        """
+        if len(mesh.faces) == 0:
+            return set()
+        inv    = mesh.edges_unique_inverse
+        counts = np.bincount(inv, minlength=len(mesh.edges_unique))
+        b_mask = counts == 1
+        b_edges = mesh.edges_unique[b_mask]
+        verts  = np.round(mesh.vertices, decimals=6)
+        return {
+            frozenset((tuple(verts[e[0]]), tuple(verts[e[1]])))
+            for e in b_edges
+        }
+
     def _prepare_mesh(self, mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
         """Minimal mesh cleanup before handing off to the C++ solver.
 
@@ -495,17 +650,32 @@ class QuadWild:
         2. Remove degenerate faces.
         3. Fix inverted normals and face winding.
         """
+        # O. Init variables
+        threshold = 1e-6
+        digits_vertex = max(1, int(-math.log10(threshold)))
+
         # 1. Merge duplicate / near-duplicate vertices
         mesh = trimesh.util.concatenate([mesh])  # returns a copy
-        # mesh.merge_vertices(merge_tex=False, merge_norm=False)
+        mesh.merge_vertices(
+            merge_tex=False, 
+            merge_norm=False,
+            digits_vertex=digits_vertex,
+            digits_norm=max(1, digits_vertex - 1),
+            digits_uv=max(1, digits_vertex - 1),
+        )
 
-        # # 2. Remove degenerate faces
-        # # mesh.update_faces(mesh.nondegenerate_faces())
-        # mesh.remove_unreferenced_vertices()
+        # 2. Remove degenerate faces
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.update_faces(mesh.unique_faces())
+        mesh.remove_unreferenced_vertices()
 
-        # # 3. Fix normals / winding
-        # trimesh.repair.fix_normals(mesh)
-        # trimesh.repair.fix_winding(mesh)
+        # Refresh caches so normals/UVs stay consistent
+        mesh._cache.clear()
+
+        # 3. Fix normals / winding
+        trimesh.repair.fix_normals(mesh)
+        trimesh.repair.fix_winding(mesh)
+        self._recompute_smooth_normals(mesh)
 
         if not mesh.is_watertight:
             print(
@@ -516,171 +686,8 @@ class QuadWild:
         return mesh
 
     # ------------------------------------------------------------------
-    # Private — OBJ export (format expected by the C++ libs)
+    # Private — OBJ import / export (format expected by the C++ libs)
     # ------------------------------------------------------------------
-
-    def _export_obj(self, mesh: "trimesh.Trimesh", obj_path: str) -> None:
-        """Write a minimal OBJ file with per-face normals.
-
-        Format::
-
-            v  x y z          (one vertex per line)
-            vn nx ny nz       (one face-normal per line, 1-indexed from faces)
-            f  vi//ni vi//ni vi//ni   (vertex index // normal index, 1-based)
-
-        This is the exact format consumed by ``remeshAndField2``.
-        """
-        verts        = mesh.vertices
-        faces        = mesh.faces
-        face_normals = mesh.face_normals
-
-        with open(obj_path, "w") as f:
-            f.write("# OBJ file\n")
-            for v in verts:
-                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-            for n in face_normals:
-                f.write(f"vn {n[0]:.4f} {n[1]:.4f} {n[2]:.4f}\n")
-            for fi, face in enumerate(faces):
-                ni   = fi + 1  # 1-indexed
-                vstr = " ".join(f"{int(vi) + 1}//{ni}" for vi in face)
-                f.write(f"f {vstr}\n")
-
-    # ------------------------------------------------------------------
-    # Private — sharp-feature export
-    # ------------------------------------------------------------------
-
-    def _export_sharp(
-        self,
-        mesh: "trimesh.Trimesh",
-        sharp_path: str,
-        sharp_angle: float,
-    ) -> int:
-        """Write the ``.sharp`` feature file consumed by ``remeshAndField2``.
-
-        File format::
-
-            <count>
-            <convexity>,<face_index>,<edge_index_in_face>
-            ...
-
-        *edge_index_in_face* is the 0-based position of the edge in the face's
-        local edge list, following trimesh's adjacency edge ordering:
-
-        * 0 → vertices 0–1 of the face
-        * 1 → vertices 1–2 of the face
-        * 2 → vertices 0–2 of the face
-
-        Returns the number of sharp edges written.
-        """
-        entries = self._detect_sharp_edges(mesh, sharp_angle)
-        with open(sharp_path, "w") as f:
-            f.write(f"{len(entries)}\n")
-            for convexity, face_idx, edge_local in entries:
-                f.write(f"{convexity},{face_idx},{edge_local}\n")
-        return len(entries)
-
-    def _detect_sharp_edges(
-        self,
-        mesh: "trimesh.Trimesh",
-        sharp_angle: float,
-    ) -> list:
-        """Return ``(convexity, face_index, edge_index_in_face)`` for every sharp edge.
-
-        An edge is sharp when:
-
-        * Its dihedral angle between adjacent faces exceeds *sharp_angle*, **or**
-        * It is a boundary edge (belongs to only one face).
-
-        Note: QRemeshify also marks UV seam edges and material-boundary edges
-        as sharp.  These require per-face UV / material metadata that is not
-        available in a plain :class:`trimesh.Trimesh`, so they are not
-        replicated here.
-
-        The detection is vectorised; no Python-level loops over faces are used
-        except for the final boundary-edge collection which is typically sparse.
-        """
-        threshold_rad = math.radians(sharp_angle)
-        entries: list = []
-
-        # ── Interior edges above the angle threshold ─────────────────────────
-        # mesh.face_adjacency        : (N, 2) face-index pairs
-        # mesh.face_adjacency_edges  : (N, 2) vertex-index pairs for each shared edge
-        # mesh.face_adjacency_angles : (N,)   angle between face normals (radians)
-        adj        = mesh.face_adjacency           # (N, 2)
-        adj_edges  = mesh.face_adjacency_edges     # (N, 2)
-        adj_angles = mesh.face_adjacency_angles    # (N,)
-
-        sharp_mask = adj_angles > threshold_rad
-        sharp_idxs = np.where(sharp_mask)[0]
-
-        for k in sharp_idxs:
-            fi0       = int(adj[k, 0])
-            fi1       = int(adj[k, 1])
-            ev        = (int(adj_edges[k, 0]), int(adj_edges[k, 1]))
-            ei_local  = self._edge_index_in_face(mesh.faces[fi0], ev)
-            if ei_local < 0:
-                continue
-            convexity = self._edge_convexity(mesh, fi0, fi1)
-            entries.append((convexity, fi0, ei_local))
-
-        # ── Boundary edges ────────────────────────────────────────────────────
-        # mesh.edges has shape (F*3, 2) in the same tri-per-face ordering as
-        # mesh.edges_unique_inverse, so fi*3+local_idx indexes correctly.
-        n_faces         = len(mesh.faces)
-        unique_inv      = mesh.edges_unique_inverse           # (F*3,)
-        unique_count    = np.bincount(unique_inv, minlength=len(mesh.edges_unique))
-        boundary_unique = unique_count[unique_inv] == 1       # (F*3,) bool
-
-        face_idxs_all   = np.repeat(np.arange(n_faces), 3)   # [0,0,0, 1,1,1, ...]
-        local_idxs_all  = np.tile(np.arange(3), n_faces)     # [0,1,2, 0,1,2, ...]
-
-        boundary_fi = face_idxs_all[boundary_unique].tolist()
-        boundary_ei = local_idxs_all[boundary_unique].tolist()
-        for fi, ei in zip(boundary_fi, boundary_ei):
-            entries.append((1, fi, ei))  # boundary edges are convex by convention
-
-        return entries
-
-    def _edge_index_in_face(
-        self, face: np.ndarray, edge_verts: tuple
-    ) -> int:
-        """Return the local 0-based index (0–2) of *edge_verts* within *face*.
-
-        Uses trimesh's edge-within-face ordering:
-        0 → (v0, v1), 1 → (v1, v2), 2 → (v0, v2).
-        Returns ``-1`` if the edge is not found.
-        """
-        ev = frozenset(edge_verts)
-        triples = (
-            (face[0], face[1]),
-            (face[1], face[2]),
-            (face[0], face[2]),
-        )
-        for i, (va, vb) in enumerate(triples):
-            if frozenset((va, vb)) == ev:
-                return i
-        return -1
-
-    def _edge_convexity(
-        self,
-        mesh: "trimesh.Trimesh",
-        fi0: int,
-        fi1: int,
-    ) -> int:
-        """Return 1 (convex / ridge) or 0 (concave / valley).
-
-        Convex means the centroid of *fi1* lies on the negative side of *fi0*'s
-        oriented plane — i.e. the surface folds outward (ridge).
-        """
-        n0  = mesh.face_normals[fi0]
-        c0  = mesh.triangles_center[fi0]
-        c1  = mesh.triangles_center[fi1]
-        return 1 if float(np.dot(n0, c1 - c0)) < 0.0 else 0
-
-    # ------------------------------------------------------------------
-    # Private — OBJ import (output from the C++ libs)
-    # ------------------------------------------------------------------
-
     def _import_obj(self, obj_path: str) -> "trimesh.Trimesh":
         """Parse the minimal OBJ produced by the C++ libs (``v`` + ``f`` only).
 
@@ -709,6 +716,186 @@ class QuadWild:
             process=False,
         )
 
+    def _export_obj(self, mesh: "trimesh.Trimesh", obj_path: str) -> None:
+        """Write a minimal OBJ file with per-face normals.
+
+        Format::
+
+            v  x y z          (one vertex per line)
+            vn nx ny nz       (one face-normal per line, 1-indexed from faces)
+            f  vi//ni vi//ni vi//ni   (vertex index // normal index, 1-based)
+
+        This is the exact format consumed by ``remeshAndField2``.
+        """
+        verts, faces, normals = mesh.vertices, mesh.faces, mesh.face_normals
+        with open(obj_path, "w") as f:
+            f.write("# OBJ file\n")
+            f.writelines(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n" for v in verts)
+            f.writelines(f"vn {n[0]:.4f} {n[1]:.4f} {n[2]:.4f}\n" for n in normals)
+            f.writelines(
+                f"f {' '.join(f'{int(vi) + 1}//{fi + 1}' for vi in face)}\n"
+                for fi, face in enumerate(faces)
+            )
+
+    # ------------------------------------------------------------------
+    # Private — sharp-feature export
+    # ------------------------------------------------------------------
+
+    def _export_sharp(
+        self,
+        mesh: "trimesh.Trimesh",
+        sharp_path: str,
+        sharp_angle: float,
+        *,
+        pre_merge_boundary_positions: Optional[set] = None,
+    ) -> int:
+        """Write the ``.sharp`` feature file consumed by ``remeshAndField2``.
+
+        File format::
+
+            <count>
+            <convexity>,<face_index>,<edge_index_in_face>
+            ...
+
+        *edge_index_in_face* is the 0-based position of the edge in the face's
+        local edge list, following trimesh's adjacency edge ordering:
+
+        * 0 → vertices 0–1 of the face
+        * 1 → vertices 1–2 of the face
+        * 2 → vertices 0–2 of the face
+
+        Returns the number of sharp edges written.
+        """
+        entries = self._detect_sharp_edges(
+            mesh, sharp_angle,
+            pre_merge_boundary_positions=pre_merge_boundary_positions,
+        )
+        with open(sharp_path, "w") as f:
+            f.write(f"{len(entries)}\n")
+            f.writelines(f"{c},{fi},{ei}\n" for c, fi, ei in entries)
+        return len(entries)
+
+    def _detect_sharp_edges(
+        self,
+        mesh: "trimesh.Trimesh",
+        sharp_angle: float,
+        *,
+        pre_merge_boundary_positions: Optional[set] = None,
+    ) -> list:
+        """Return ``(convexity, face_index, edge_index_in_face)`` for every sharp edge.
+
+        An edge is sharp when:
+
+        * Its dihedral angle between adjacent faces exceeds *sharp_angle*, **or**
+        * It is a boundary edge (belongs to only one face), **or**
+        * It is a UV seam edge (identified via *pre_merge_boundary_positions*).
+
+        UV seam detection
+        ~~~~~~~~~~~~~~~~~
+        When a mesh is loaded from a format that stores per-face-vertex UVs
+        (OBJ, glTF, …), trimesh duplicates vertices at UV seams.  Before the
+        position-based vertex merge in ``_prepare_mesh``, those seam edges
+        appear as boundary edges.  After merge they become regular interior
+        edges.  ``pre_merge_boundary_positions`` (computed by
+        ``_get_boundary_edge_positions`` on the raw mesh) lets us identify
+        them: any ``face_adjacency`` edge whose vertex positions were in that
+        pre-merge boundary set is a UV seam.
+        """
+        threshold_rad = math.radians(sharp_angle)
+        entries: list = []
+        added: set = set()   # (face_index, edge_local) already emitted
+
+        # ── Interior edges above the angle threshold ─────────────────────────
+        adj        = mesh.face_adjacency           # (N, 2)
+        adj_edges  = mesh.face_adjacency_edges     # (N, 2)
+        adj_angles = mesh.face_adjacency_angles    # (N,)
+
+        sharp_mask = adj_angles > threshold_rad
+        sharp_idxs = np.where(sharp_mask)[0]
+
+        for k in sharp_idxs:
+            fi0       = int(adj[k, 0])
+            fi1       = int(adj[k, 1])
+            ev        = (int(adj_edges[k, 0]), int(adj_edges[k, 1]))
+            ei_local  = self._edge_index_in_face(mesh.faces[fi0], ev)
+            if ei_local < 0:
+                continue
+            convexity = self._edge_convexity(mesh, fi0, fi1)
+            entries.append((convexity, fi0, ei_local))
+            added.add((fi0, ei_local))
+
+        # ── UV seam edges ─────────────────────────────────────────────────────
+        # Interior edges whose geometric positions were boundary edges on the
+        # raw (pre-merge) mesh — i.e. they were split at UV discontinuities.
+        if pre_merge_boundary_positions:
+            verts_rounded = np.round(mesh.vertices, decimals=6)
+            n_uv = 0
+            for k in range(len(adj)):
+                pos_pair = frozenset((
+                    tuple(verts_rounded[int(adj_edges[k, 0])]),
+                    tuple(verts_rounded[int(adj_edges[k, 1])]),
+                ))
+                if pos_pair not in pre_merge_boundary_positions:
+                    continue
+                fi0      = int(adj[k, 0])
+                fi1      = int(adj[k, 1])
+                ev       = (int(adj_edges[k, 0]), int(adj_edges[k, 1]))
+                ei_local = self._edge_index_in_face(mesh.faces[fi0], ev)
+                if ei_local < 0 or (fi0, ei_local) in added:
+                    continue
+                convexity = self._edge_convexity(mesh, fi0, fi1)
+                entries.append((convexity, fi0, ei_local))
+                added.add((fi0, ei_local))
+                n_uv += 1
+            if n_uv:
+                log.debug("[sharp]  UV seam edges added: %d", n_uv)
+
+        # ── Boundary edges ────────────────────────────────────────────────────
+        n_faces     = len(mesh.faces)
+        unique_inv  = mesh.edges_unique_inverse
+        edge_counts = np.bincount(unique_inv, minlength=len(mesh.edges_unique))
+        is_boundary = edge_counts[unique_inv] == 1
+
+        face_idxs  = np.repeat(np.arange(n_faces), 3)
+        local_idxs = np.tile(np.arange(3), n_faces)
+        entries.extend(
+            (1, fi, ei)
+            for fi, ei in zip(face_idxs[is_boundary].tolist(), local_idxs[is_boundary].tolist())
+            if (fi, ei) not in added
+        )
+
+        return entries
+
+    def _edge_index_in_face(self, face: np.ndarray, edge_verts: tuple) -> int:
+        """Return the local 0-based index (0–2) of *edge_verts* within *face*.
+
+        Trimesh ordering: 0 → (v0, v1), 1 → (v1, v2), 2 → (v0, v2).
+        Returns -1 if not found.
+        """
+        ev = frozenset(edge_verts)
+        return next(
+            (i for i, (a, b) in enumerate(
+                ((face[0], face[1]), (face[1], face[2]), (face[0], face[2])),
+            ) if frozenset((a, b)) == ev),
+            -1,
+        )
+
+    def _edge_convexity(
+        self,
+        mesh: "trimesh.Trimesh",
+        fi0: int,
+        fi1: int,
+    ) -> int:
+        """Return 1 (convex / ridge) or 0 (concave / valley).
+
+        Convex means the centroid of *fi1* lies on the negative side of *fi0*'s
+        oriented plane — i.e. the surface folds outward (ridge).
+        """
+        n0  = mesh.face_normals[fi0]
+        c0  = mesh.triangles_center[fi0]
+        c1  = mesh.triangles_center[fi1]
+        return 1 if float(np.dot(n0, c1 - c0)) < 0.0 else 0
+    
     # ------------------------------------------------------------------
     # Private — C++ library calls
     # ------------------------------------------------------------------

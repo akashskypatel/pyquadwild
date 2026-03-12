@@ -81,10 +81,11 @@ def run(
             flow_config=flow_config,
             satsuma_config=satsuma_config,
         )
-        tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
-        tmp.close()
-        result.export(tmp.name)
-        return tmp.name
+        stem = Path(input_path).stem
+        tmp_dir = tempfile.mkdtemp()
+        out_path = str(Path(tmp_dir) / f"{stem}_remeshed.glb")
+        result.export(out_path)
+        return out_path
     except QuadWildError as exc:
         print(f"[QuadWild] Pipeline error: {exc}")
         raise gr.Error(str(exc)) from exc
@@ -144,7 +145,7 @@ def build_demo() -> gr.Blocks:
                     scale=1,
                 )
                 sharp_angle = gr.Slider(
-                    minimum=1.0, maximum=179.0, step=0.5, value=35.0,
+                    minimum=1.0, maximum=179.0, step=0.5, value=45.0,
                     label="Sharp Angle (°)",
                     info="Dihedral angle threshold for sharp-edge detection.",
                     scale=3,
@@ -231,8 +232,8 @@ def build_demo() -> gr.Blocks:
                     info="Flow-solver configuration preset.",
                 )
                 satsuma_config = gr.Dropdown(
-                    choices=["DEFAULT", "MST", "ROUND2EVEN", "SYMMDC", "EDGETHRU", "LEMON", "NODETHRU"],
-                    value="DEFAULT",
+                    choices=["LEMON", "DEFAULT", "MST", "ROUND2EVEN", "SYMMDC", "EDGETHRU", "NODETHRU"],
+                    value="LEMON",
                     label="Satsuma Config",
                     info="Satsuma matching preset.",
                 )
