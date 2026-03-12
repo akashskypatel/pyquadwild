@@ -1,0 +1,14 @@
+# Core mesh I/O and manipulation
+trimesh>=4.0.0
+
+# Numerical computing (also a hard trimesh dependency)
+numpy>=1.24.0
+
+# Spatial algorithms used by trimesh (fill_holes, KD-tree queries, etc.)
+scipy>=1.10.0
+
+# Graph algorithms (required by trimesh.repair.fill_holes)
+networkx>=3.0
+
+# Gradio UI
+gradio>=4.0.0
