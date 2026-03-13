@@ -1,265 +1,127 @@
-"""app.py — Gradio demo for the QuadWild quad-remesher.
+"""server.py — Flask backend for the QuadWild HTML UI.
 
 Run with:
-    python app.py
+    python server.py
 """
 
 from __future__ import annotations
 
+import io
+import json
 import tempfile
 from pathlib import Path
 
-import gradio as gr
+from flask import Flask, request, send_file, send_from_directory
+
 import trimesh
 
 from src.quadwild import QuadWild, QuadWildError
 
-# Instantiated once — libraries are loaded at startup, not per-click.
+app = Flask(__name__, static_folder="static", static_url_path="")
+
 _qw = QuadWild()
 
 
-def run(
-    input_path: str | None,
-    # ── Basic settings ─────────────────────────────────────
-    enable_preprocess: bool,
-    enable_sharp: bool,
-    sharp_angle: float,
-    enable_smoothing: bool,
-    scale_factor: float,
-    target_quad_count: int,
-    # ── Advanced — ILP objective ────────────────────────────
-    alpha: float,
-    ilp_method: str,
-    time_limit: int,
-    gap_limit: float,
-    minimum_gap: float,
-    isometry: bool,
-    regularity_quads: bool,
-    regularity_non_quads: bool,
-    regularity_non_quads_weight: float,
-    align_singularities: bool,
-    align_singularities_weight: float,
-    repeat_losing_iterations: bool,
-    repeat_losing_quads: bool,
-    repeat_losing_non_quads: bool,
-    repeat_losing_align: bool,
-    hard_parity_constraint: bool,
-    fixed_chart_clusters: int,
-    # ── Advanced — solver presets ───────────────────────────
-    flow_config: str,
-    satsuma_config: str,
-) -> str | None:
-    if input_path is None:
-        return None
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+@app.route("/convert_to_glb", methods=["POST"])
+def convert_to_glb():
+    """Accept any mesh format, load with trimesh, and return GLB bytes."""
+    f = request.files.get("file")
+    if f is None:
+        return "No file uploaded", 400
+
+    suffix = Path(f.filename).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        f.save(tmp)
+        tmp_path = tmp.name
+
     try:
-        scene = trimesh.load(input_path, force="scene")
+        scene = trimesh.load(tmp_path, force="scene")
+        buf = io.BytesIO()
+        scene.export(buf, file_type="glb")
+        buf.seek(0)
+        return send_file(buf, mimetype="model/gltf-binary", download_name="preview.glb")
+    except Exception as exc:
+        return f"Conversion error: {exc}", 500
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@app.route("/remesh", methods=["POST"])
+def remesh():
+    """Run the QuadWild pipeline and return the result as GLB."""
+    f = request.files.get("file")
+    if f is None:
+        return "No file uploaded", 400
+
+    raw_settings = request.form.get("settings", "{}")
+    try:
+        s = json.loads(raw_settings)
+    except json.JSONDecodeError:
+        return "Invalid settings JSON", 400
+
+    suffix = Path(f.filename).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        f.save(tmp)
+        tmp_path = tmp.name
+
+    try:
+        scene = trimesh.load(tmp_path, force="scene")
+        geom_count = sum(
+            1 for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)
+        )
+
+        tqc = int(s.get("target_quad_count", 0))
+
         result = _qw.process(
             scene,
-            enable_preprocess=enable_preprocess,
-            enable_sharp=enable_sharp,
-            sharp_angle=sharp_angle,
-            enable_smoothing=enable_smoothing,
-            scale_factor=scale_factor,
-            target_quad_count=int(target_quad_count) if target_quad_count and target_quad_count > 0 else None,
-            alpha=alpha,
-            ilp_method=ilp_method,
-            time_limit=int(time_limit),
-            gap_limit=gap_limit,
-            minimum_gap=minimum_gap,
-            isometry=isometry,
-            regularity_quads=regularity_quads,
-            regularity_non_quads=regularity_non_quads,
-            regularity_non_quads_weight=regularity_non_quads_weight,
-            align_singularities=align_singularities,
-            align_singularities_weight=align_singularities_weight,
-            repeat_losing_iterations=repeat_losing_iterations,
-            repeat_losing_quads=repeat_losing_quads,
-            repeat_losing_non_quads=repeat_losing_non_quads,
-            repeat_losing_align=repeat_losing_align,
-            hard_parity_constraint=hard_parity_constraint,
-            fixed_chart_clusters=int(fixed_chart_clusters),
-            flow_config=flow_config,
-            satsuma_config=satsuma_config,
+            enable_preprocess=s.get("enable_preprocess", True),
+            enable_sharp=s.get("enable_sharp", True),
+            sharp_angle=float(s.get("sharp_angle", 45)),
+            enable_smoothing=s.get("enable_smoothing", True),
+            scale_factor=float(s.get("scale_factor", 1.0)),
+            target_quad_count=tqc if tqc > 0 else None,
+            alpha=float(s.get("alpha", 0.005)),
+            ilp_method=s.get("ilp_method", "LEASTSQUARES"),
+            time_limit=int(s.get("time_limit", 200)),
+            gap_limit=float(s.get("gap_limit", 0.0)),
+            minimum_gap=float(s.get("minimum_gap", 0.4)),
+            isometry=s.get("isometry", True),
+            regularity_quads=s.get("regularity_quads", True),
+            regularity_non_quads=s.get("regularity_non_quads", True),
+            regularity_non_quads_weight=float(
+                s.get("regularity_non_quads_weight", 0.9)
+            ),
+            align_singularities=s.get("align_singularities", True),
+            align_singularities_weight=float(
+                s.get("align_singularities_weight", 0.1)
+            ),
+            repeat_losing_iterations=s.get("repeat_losing_iterations", True),
+            repeat_losing_quads=s.get("repeat_losing_quads", False),
+            repeat_losing_non_quads=s.get("repeat_losing_non_quads", False),
+            repeat_losing_align=s.get("repeat_losing_align", True),
+            hard_parity_constraint=s.get("hard_parity_constraint", True),
+            fixed_chart_clusters=int(s.get("fixed_chart_clusters", 0)),
+            flow_config=s.get("flow_config", "SIMPLE"),
+            satsuma_config=s.get("satsuma_config", "LEMON"),
         )
-        stem = Path(input_path).stem
-        tmp_dir = tempfile.mkdtemp()
-        out_path = str(Path(tmp_dir) / f"{stem}_remeshed.glb")
-        result.export(out_path)
-        return out_path
+
+        buf = io.BytesIO()
+        result.export(buf, file_type="glb")
+        buf.seek(0)
+        return send_file(buf, mimetype="model/gltf-binary", download_name="result.glb")
+
     except QuadWildError as exc:
-        print(f"[QuadWild] Pipeline error: {exc}")
-        raise gr.Error(str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        print(f"[QuadWild] Unexpected error: {exc}")
-        raise gr.Error(f"Unexpected error: {exc}") from exc
-
-
-# ---------------------------------------------------------------------------
-# UI
-# ---------------------------------------------------------------------------
-
-def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="QuadWild — Quad Remesher") as demo:
-        gr.Markdown(
-            "# QuadWild — Quad Remesher\n"
-            "Upload a 3-D mesh, tune the parameters, and press **Remesh** to "
-            "generate a clean quad topology."
-        )
-
-        # ── Viewers ──────────────────────────────────────────────────────────
-        with gr.Row():
-            input_model = gr.Model3D(
-                label="Input",
-                display_mode="solid",
-                height=420,
-                scale=1,
-            )
-            output_model = gr.Model3D(
-                label="Output (quad mesh)",
-                display_mode="solid",
-                height=420,
-                scale=1,
-            )
-
-        remesh_btn = gr.Button("Remesh", variant="primary", size="lg")
-
-        # ── Basic settings ────────────────────────────────────────────────────
-        with gr.Accordion("Basic Settings", open=True):
-            with gr.Row():
-                enable_preprocess = gr.Checkbox(
-                    value=True,
-                    label="Preprocess",
-                    info="Decimate, triangulate and repair the mesh before field computation.",
-                )
-                enable_smoothing = gr.Checkbox(
-                    value=True,
-                    label="Smoothing",
-                    info="Apply Laplacian smoothing after quadrangulation.",
-                )
-
-            with gr.Row():
-                enable_sharp = gr.Checkbox(
-                    value=True,
-                    label="Detect Sharp Features",
-                    info="Mark edges above the angle threshold as feature lines.",
-                    scale=1,
-                )
-                sharp_angle = gr.Slider(
-                    minimum=1.0, maximum=179.0, step=0.5, value=45.0,
-                    label="Sharp Angle (°)",
-                    info="Dihedral angle threshold for sharp-edge detection.",
-                    scale=3,
-                )
-
-            with gr.Row():
-                target_quad_count = gr.Number(
-                    value=0, minimum=0, precision=0,
-                    label="Target Quad Count",
-                    info="Approximate number of output quads. Overrides Scale Factor when > 0.",
-                    scale=1,
-                )
-                scale_factor = gr.Slider(
-                    minimum=0.1, maximum=5.0, step=0.05, value=1.0,
-                    label="Scale Factor",
-                    info="> 1 → larger quads (coarser);  < 1 → smaller quads (more detail). Ignored when Target Quad Count > 0.",
-                    scale=2,
-                )
-
-        # ── Advanced settings ─────────────────────────────────────────────────
-        with gr.Accordion("Advanced Settings", open=False):
-
-            gr.Markdown("### ILP Objective")
-            with gr.Row():
-                alpha = gr.Slider(
-                    minimum=0.0, maximum=0.999, step=0.001, value=0.005,
-                    label="Alpha",
-                    info="Blend: α → isometry,  1–α → regularity.",
-                )
-                ilp_method = gr.Dropdown(
-                    choices=["LEASTSQUARES", "ABS"],
-                    value="LEASTSQUARES",
-                    label="ILP Method",
-                )
-
-            with gr.Row():
-                time_limit = gr.Number(
-                    value=200, minimum=1, precision=0,
-                    label="Time Limit (s)",
-                    info="Hard wall-clock limit for the ILP solver.",
-                )
-                gap_limit = gr.Number(
-                    value=0.0, minimum=0.0, precision=4,
-                    label="Gap Limit",
-                    info="Stop early when optimality gap drops to this value (0 = disabled).",
-                )
-                minimum_gap = gr.Number(
-                    value=0.4, minimum=0.0, precision=4,
-                    label="Minimum Gap",
-                    info="The solver must achieve at least this gap.",
-                )
-
-            gr.Markdown("### Regularity & Alignment")
-            with gr.Row():
-                isometry = gr.Checkbox(value=True, label="Isometry")
-                regularity_quads = gr.Checkbox(value=True, label="Regularity Quads")
-                regularity_non_quads = gr.Checkbox(value=True, label="Regularity Non-Quads")
-                hard_parity_constraint = gr.Checkbox(value=True, label="Hard Parity Constraint")
-
-            with gr.Row():
-                regularity_non_quads_weight = gr.Slider(
-                    minimum=0.0, maximum=1.0, step=0.01, value=0.9,
-                    label="Regularity Non-Quads Weight",
-                )
-                align_singularities = gr.Checkbox(value=True, label="Align Singularities")
-                align_singularities_weight = gr.Slider(
-                    minimum=0.0, maximum=1.0, step=0.01, value=0.1,
-                    label="Singularity Alignment Weight",
-                )
-
-            gr.Markdown("### Constraint Recovery")
-            with gr.Row():
-                repeat_losing_iterations = gr.Checkbox(value=True,  label="Repeat Iterations")
-                repeat_losing_quads      = gr.Checkbox(value=False, label="Repeat Quads")
-                repeat_losing_non_quads  = gr.Checkbox(value=False, label="Repeat Non-Quads")
-                repeat_losing_align      = gr.Checkbox(value=True,  label="Repeat Align")
-
-            gr.Markdown("### Solver Presets")
-            with gr.Row():
-                flow_config = gr.Dropdown(
-                    choices=["SIMPLE", "HALF"],
-                    value="SIMPLE",
-                    label="Flow Config",
-                    info="Flow-solver configuration preset.",
-                )
-                satsuma_config = gr.Dropdown(
-                    choices=["LEMON", "DEFAULT", "MST", "ROUND2EVEN", "SYMMDC", "EDGETHRU", "NODETHRU"],
-                    value="LEMON",
-                    label="Satsuma Config",
-                    info="Satsuma matching preset.",
-                )
-
-            fixed_chart_clusters = gr.Number(
-                value=0, minimum=0, precision=0,
-                label="Fixed Chart Clusters",
-                info="Force a fixed number of chart clusters (0 = auto).",
-            )
-
-        # ── Wiring ────────────────────────────────────────────────────────────
-        all_inputs = [
-            input_model,
-            enable_preprocess, enable_sharp, sharp_angle, enable_smoothing, scale_factor, target_quad_count,
-            alpha, ilp_method, time_limit, gap_limit, minimum_gap,
-            isometry, regularity_quads, regularity_non_quads, regularity_non_quads_weight,
-            align_singularities, align_singularities_weight,
-            repeat_losing_iterations, repeat_losing_quads, repeat_losing_non_quads, repeat_losing_align,
-            hard_parity_constraint, fixed_chart_clusters,
-            flow_config, satsuma_config,
-        ]
-
-        remesh_btn.click(fn=run, inputs=all_inputs, outputs=output_model)
-
-    return demo
+        return f"QuadWild error: {exc}", 500
+    except Exception as exc:
+        return f"Unexpected error: {exc}", 500
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    build_demo().launch()
+    app.run(host="0.0.0.0", port=7860, debug=True)

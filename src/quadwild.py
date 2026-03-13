@@ -26,10 +26,8 @@ from __future__ import annotations
 
 import logging
 import math
-import multiprocessing
 import platform
 import shutil
-import sys
 import tempfile
 from ctypes import (
     POINTER, Structure, byref, c_bool, c_char_p, c_double, c_float, c_int, cdll,
@@ -182,7 +180,6 @@ class QuadWild:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
     def process(
         self,
         mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
@@ -219,14 +216,23 @@ class QuadWild:
         # Callback schedule (8-element lists; defaults are used when None)
         callback_time_limit: Optional[List[float]] = None,
         callback_gap_limit: Optional[List[float]] = None,
+        # ── Processing strategy ────────────────────────────────────
+        force_merge: bool = False,
         # Diagnostics
         debug_dir: Optional[Union[str, Path]] = None,
     ) -> "trimesh.Scene":
         """Run the full QuadWild + Bi-MDF quad-remeshing pipeline.
 
-        Multi-geometry scenes are **merged** into a single mesh before
-        processing (the C++ libs operate on one OBJ at a time).  The result
-        is returned as a single-geometry :class:`trimesh.Scene`.
+        The processing strategy is chosen automatically based on the input:
+
+        * A :class:`trimesh.Trimesh` or a single-geometry scene is processed
+          by :meth:`_process_mesh` (the entire mesh in one shot).
+        * A scene with **multiple geometries** is processed by
+          :meth:`_process_scene` (each geometry independently; the original
+          scene graph is reconstructed with the remeshed geometries).
+
+        Set *force_merge* to ``True`` to override the automatic strategy and
+        always merge all geometries into a single mesh before processing.
 
         Parameters
         ----------
@@ -315,7 +321,7 @@ class QuadWild:
               uses dihedral angle and boundary.  The ``01_sharp.sharp`` file
               will therefore typically contain fewer entries than Blender's.
             * **Mesh cleanup**: vertex merging, degenerate-face removal, and
-              normal fixes are currently commented out in ``_prepare_mesh``.
+              normal fixes are currently commented out in ``_preprocess_mesh``.
               Blender's bmesh always produces a clean, consistently-wound mesh.
             * **Coordinate space**: QRemeshify strips the object's translation
               (applies only rotation + scale) so the mesh is centred near the
@@ -343,41 +349,190 @@ class QuadWild:
         if satsuma_config not in _SATSUMA_CONFIGS:
             raise ValueError(f"satsuma_config must be one of {list(_SATSUMA_CONFIGS)}, got {satsuma_config!r}")
 
-        dbg = debug_dir is not None
-        if dbg:
+        if debug_dir is not None:
             debug_dir = Path(debug_dir)
             debug_dir.mkdir(parents=True, exist_ok=True)
 
-        scene  = self._to_scene(mesh)
-        merged = self._to_mesh(scene)
+        cb_time = callback_time_limit or [3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0]
+        cb_gap  = callback_gap_limit  or [0.005, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.3]
 
-        # Detect UV seam edges *before* vertex merge collapses them.
-        pre_merge_boundary = self._get_boundary(merged) if enable_sharp else set()
+        scene       = self._to_scene(mesh)
+        geom_meshes = {k: v for k, v in scene.geometry.items() if isinstance(v, trimesh.Trimesh)}
 
-        merged = self._prepare_mesh(merged)
-
-        log.debug(
-            "[stage 0 / input]  vertices=%d  faces=%d  watertight=%s",
-            len(merged.vertices), len(merged.faces), merged.is_watertight,
+        pipeline_kwargs = dict(
+            enable_preprocess=enable_preprocess,
+            enable_sharp=enable_sharp,
+            sharp_angle=sharp_angle,
+            enable_smoothing=enable_smoothing,
+            scale_factor=scale_factor,
+            fixed_chart_clusters=fixed_chart_clusters,
+            alpha=alpha,
+            ilp_method=ilp_method,
+            time_limit=time_limit,
+            gap_limit=gap_limit,
+            minimum_gap=minimum_gap,
+            isometry=isometry,
+            regularity_quads=regularity_quads,
+            regularity_non_quads=regularity_non_quads,
+            regularity_non_quads_weight=regularity_non_quads_weight,
+            align_singularities=align_singularities,
+            align_singularities_weight=align_singularities_weight,
+            repeat_losing_iterations=repeat_losing_iterations,
+            repeat_losing_quads=repeat_losing_quads,
+            repeat_losing_non_quads=repeat_losing_non_quads,
+            repeat_losing_align=repeat_losing_align,
+            hard_parity_constraint=hard_parity_constraint,
+            flow_config=flow_config,
+            satsuma_config=satsuma_config,
+            callback_time_limit=cb_time,
+            callback_gap_limit=cb_gap,
         )
 
-        if target_quad_count is not None and target_quad_count > 0:
-            scale_factor = self._estimate_scale_factor(merged, target_quad_count)
-            log.debug(
-                "[stage 0 / input]  target_quad_count=%d → scale_factor=%.4f",
-                target_quad_count, scale_factor,
+        if not force_merge and len(geom_meshes) > 1:
+            return self._process_scene(
+                scene,
+                target_quad_count=target_quad_count,
+                debug_dir=debug_dir,
+                **pipeline_kwargs,
             )
 
-        log.debug(
+        tri_mesh = self._to_mesh(scene)
+        result = self._process_mesh(
+            tri_mesh,
+            target_quad_count=target_quad_count,
+            debug_dir=debug_dir,
+            **pipeline_kwargs,
+        )
+        if debug_dir is not None:
+            log.info("[debug]  intermediate files saved to %s", debug_dir)
+        return trimesh.Scene({"mesh": result})
+
+    # ------------------------------------------------------------------
+    # Private — pipeline helpers
+    # ------------------------------------------------------------------
+
+    def _process_scene(
+        self,
+        scene: "trimesh.Scene",
+        *,
+        target_quad_count: Optional[int],
+        debug_dir: Optional[Path],
+        **pipeline_kwargs,
+    ) -> "trimesh.Scene":
+        """Process each :class:`trimesh.Trimesh` geometry in *scene* in parallel.
+
+        Each geometry is handed off to :meth:`_process_mesh` via a
+        :class:`~concurrent.futures.ThreadPoolExecutor`.  Because
+        :meth:`_process_mesh` blocks on a C++ subprocess (``proc.join``),
+        the GIL is released during the wait and all subprocesses run
+        concurrently without pickling or ctypes complications.
+
+        *target_quad_count* is distributed proportionally across geometries by
+        face count.  All other solver parameters are forwarded via
+        *pipeline_kwargs* to :meth:`_process_mesh`.
+        """
+        geom_meshes = {k: v for k, v in scene.geometry.items() if isinstance(v, trimesh.Trimesh)}
+        log.info("[_process_scene]  %d geometries to process in parallel", len(geom_meshes))
+
+        _MIN_QUADS_PER_PART = 50
+
+        if target_quad_count is not None and target_quad_count > 0:
+            total_faces = sum(len(g.faces) for g in geom_meshes.values())
+            if total_faces > 0:
+                per_geom_target: dict = {
+                    name: max(_MIN_QUADS_PER_PART, round(target_quad_count * len(geom.faces) / total_faces))
+                    for name, geom in geom_meshes.items()
+                }
+            else:
+                equal_share = max(_MIN_QUADS_PER_PART, target_quad_count // len(geom_meshes))
+                per_geom_target = {name: equal_share for name in geom_meshes}
+        else:
+            per_geom_target = {name: None for name in geom_meshes}
+
+        def _remesh_process(name: str, geom: "trimesh.Trimesh") -> tuple:
+            log.info("[_process_scene]  processing geometry %r …", name)
+            geom_debug = (debug_dir / name) if debug_dir else None
+            if geom_debug:
+                geom_debug.mkdir(parents=True, exist_ok=True)
+            result = self._process_mesh(
+                geom.copy(),
+                target_quad_count=per_geom_target[name],
+                debug_dir=geom_debug,
+                **pipeline_kwargs,
+            )
+            log.info("[_process_scene]  done  geometry %r", name)
+            if geom_debug:
+                log.info("[_process_scene]  geometry %r files saved to %s", name, geom_debug)
+            return name, result
+
+        remeshed = dict([_remesh_process(name, geom) for name, geom in geom_meshes.items()])
+
+        new_scene = scene.copy()
+        new_scene.geometry.update(remeshed)
+        return new_scene
+
+    def _process_mesh(
+        self,
+        mesh: "trimesh.Trimesh",
+        *,
+        target_quad_count: Optional[int],
+        debug_dir: Optional[Path],
+        enable_preprocess: bool,
+        enable_sharp: bool,
+        sharp_angle: float,
+        enable_smoothing: bool,
+        scale_factor: float,
+        fixed_chart_clusters: int,
+        alpha: float,
+        ilp_method: str,
+        time_limit: int,
+        gap_limit: float,
+        minimum_gap: float,
+        isometry: bool,
+        regularity_quads: bool,
+        regularity_non_quads: bool,
+        regularity_non_quads_weight: float,
+        align_singularities: bool,
+        align_singularities_weight: float,
+        repeat_losing_iterations: bool,
+        repeat_losing_quads: bool,
+        repeat_losing_non_quads: bool,
+        repeat_losing_align: bool,
+        hard_parity_constraint: bool,
+        flow_config: str,
+        satsuma_config: str,
+        callback_time_limit: List[float],
+        callback_gap_limit: List[float],
+    ) -> "trimesh.Trimesh":
+        """Run the full three-stage C++ pipeline on a single mesh.
+
+        Returns the quad-remeshed :class:`trimesh.Trimesh`.
+        """
+        # Detect UV seam edges *before* vertex merge collapses them.
+        pre_merge_boundary = self._get_boundary(mesh) if enable_sharp else set()
+
+        mesh = self._preprocess_mesh(mesh)
+
+        log.info(
+            "[stage 0 / input]  vertices=%d  faces=%d  watertight=%s",
+            len(mesh.vertices), len(mesh.faces), mesh.is_watertight,
+        )
+
+        current_scale_factor = scale_factor
+        if target_quad_count is not None and target_quad_count > 0:
+            current_scale_factor = self._estimate_scale_factor(mesh, target_quad_count)
+            log.info(
+                "[stage 0 / input]  target_quad_count=%d → scale_factor=%.4f",
+                target_quad_count, current_scale_factor,
+            )
+
+        log.info(
             "[stage 0 / params]  enable_preprocess=%s  enable_sharp=%s  "
             "sharp_angle=%.1f  enable_smoothing=%s  scale_factor=%.4f  "
             "ilp_method=%s  alpha=%.4f  time_limit=%d  flow_config=%s  satsuma_config=%s",
             enable_preprocess, enable_sharp, sharp_angle, enable_smoothing,
-            scale_factor, ilp_method, alpha, time_limit, flow_config, satsuma_config,
+            current_scale_factor, ilp_method, alpha, time_limit, flow_config, satsuma_config,
         )
-
-        cb_time = callback_time_limit or [3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0]
-        cb_gap  = callback_gap_limit  or [0.005, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.3]
 
         tmpdir = tempfile.mkdtemp(prefix="quadwild_")
         try:
@@ -391,120 +546,89 @@ class QuadWild:
             out_path      = base + "_rem_p0_0_quadrangulation.obj"
             out_smooth    = base + "_rem_p0_0_quadrangulation_smooth.obj"
 
-            self._export_obj(merged, obj_path)
-            log.debug("[stage 0 / export]  wrote input OBJ → %s", obj_path)
-            if dbg:
+            self._export_obj(mesh, obj_path)
+            log.info("[stage 0 / export]  wrote input OBJ → %s", obj_path)
+            if debug_dir:
                 shutil.copy2(obj_path, debug_dir / "00_input.obj")
 
             if enable_sharp:
                 n_features = self._export_sharp(
-                    merged, sharp_path, sharp_angle,
+                    mesh, sharp_path, sharp_angle,
                     pre_merge_boundary_positions=pre_merge_boundary,
                 )
-                log.debug(
+                log.info(
                     "[stage 0 / sharp]  sharp edges written = %d  (angle threshold = %.1f°)",
                     n_features, sharp_angle,
                 )
-                if dbg:
+                if debug_dir:
                     shutil.copy2(sharp_path, debug_dir / "01_sharp.sharp")
             else:
                 n_features = 0
-                log.debug("[stage 0 / sharp]  sharp detection disabled")
+                log.info("[stage 0 / sharp]  sharp detection disabled")
 
-            # ── Run C++ stages in a subprocess so a C++ crash (SIGABRT / SIGSEGV)
-            # ── cannot kill the Python process. The child inherits all ctypes
-            # ── library handles via fork and writes results to the shared tmpdir.
-            error_file = path.join(tmpdir, "_error.txt")
-
-            def _cpp_worker():
-                try:
-                    self._call_remesh_and_field(
-                        obj_path=obj_path,
-                        sharp_path=sharp_path,
-                        field_path=field_path,
-                        enable_preprocess=enable_preprocess,
-                        enable_sharp=enable_sharp and n_features > 0,
-                        sharp_angle=sharp_angle,
-                    )
-                    self._call_trace(remeshed_base)
-                    self._call_quadrangulate(
-                        traced_path=traced_path,
-                        enable_smoothing=enable_smoothing,
-                        scale_factor=scale_factor,
-                        fixed_chart_clusters=fixed_chart_clusters,
-                        alpha=alpha,
-                        ilp_method=ilp_method,
-                        time_limit=time_limit,
-                        gap_limit=gap_limit,
-                        minimum_gap=minimum_gap,
-                        isometry=isometry,
-                        regularity_quads=regularity_quads,
-                        regularity_non_quads=regularity_non_quads,
-                        regularity_non_quads_weight=regularity_non_quads_weight,
-                        align_singularities=align_singularities,
-                        align_singularities_weight=align_singularities_weight,
-                        repeat_losing_iterations=repeat_losing_iterations,
-                        repeat_losing_quads=repeat_losing_quads,
-                        repeat_losing_non_quads=repeat_losing_non_quads,
-                        repeat_losing_align=repeat_losing_align,
-                        hard_parity_constraint=hard_parity_constraint,
-                        flow_config=flow_config,
-                        satsuma_config=satsuma_config,
-                        callback_time_limit=cb_time,
-                        callback_gap_limit=cb_gap,
-                    )
-                except Exception as exc:
-                    try:
-                        with open(error_file, "w") as _f:
-                            _f.write(str(exc))
-                    except OSError:
-                        pass
-                    sys.exit(1)
-
-            log.debug("[stages 1–3]  running C++ pipeline in subprocess …")
-            proc = multiprocessing.Process(target=_cpp_worker, daemon=True)
-            proc.start()
-            proc.join(timeout=time_limit + 120)
-
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(5)
-                raise QuadWildError(f"Pipeline timed out (>{time_limit + 120}s)")
-            if proc.exitcode != 0:
-                err_msg = (
-                    Path(error_file).read_text().strip()
-                    if path.isfile(error_file)
-                    else f"C++ pipeline failed or crashed (exitcode={proc.exitcode})"
-                )
-                raise QuadWildError(err_msg)
-
-            log.debug("[stages 1–3 / done]")
+            log.info("[stages 1–3]  running C++ pipeline …")
+            self._call_remesh_and_field(
+                obj_path=obj_path,
+                sharp_path=sharp_path,
+                field_path=field_path,
+                enable_preprocess=enable_preprocess,
+                enable_sharp=enable_sharp and n_features > 0,
+                sharp_angle=sharp_angle,
+            )
+            self._call_trace(remeshed_base)
+            self._call_quadrangulate(
+                traced_path=traced_path,
+                enable_smoothing=enable_smoothing,
+                scale_factor=current_scale_factor,
+                fixed_chart_clusters=fixed_chart_clusters,
+                alpha=alpha,
+                ilp_method=ilp_method,
+                time_limit=time_limit,
+                gap_limit=gap_limit,
+                minimum_gap=minimum_gap,
+                isometry=isometry,
+                regularity_quads=regularity_quads,
+                regularity_non_quads=regularity_non_quads,
+                regularity_non_quads_weight=regularity_non_quads_weight,
+                align_singularities=align_singularities,
+                align_singularities_weight=align_singularities_weight,
+                repeat_losing_iterations=repeat_losing_iterations,
+                repeat_losing_quads=repeat_losing_quads,
+                repeat_losing_non_quads=repeat_losing_non_quads,
+                repeat_losing_align=repeat_losing_align,
+                hard_parity_constraint=hard_parity_constraint,
+                flow_config=flow_config,
+                satsuma_config=satsuma_config,
+                callback_time_limit=callback_time_limit,
+                callback_gap_limit=callback_gap_limit,
+            )
+            log.info("[stages 1–3 / done]")
 
             remeshed_path = remeshed_base + ".obj"
             if path.isfile(remeshed_path):
                 rem = self._import_obj(remeshed_path)
-                log.debug(
+                log.info(
                     "[stage 1]  remeshed mesh: vertices=%d  faces=%d",
                     len(rem.vertices), len(rem.faces),
                 )
-                if dbg:
+                if debug_dir:
                     shutil.copy2(remeshed_path, debug_dir / "02_remeshed.obj")
             if path.isfile(traced_path):
                 tr = self._import_obj(traced_path)
-                log.debug(
+                log.info(
                     "[stage 2]  traced mesh:   vertices=%d  faces=%d",
                     len(tr.vertices), len(tr.faces),
                 )
-                if dbg:
+                if debug_dir:
                     shutil.copy2(traced_path, debug_dir / "03_traced.obj")
-            if path.isfile(out_path) and dbg:
+            if path.isfile(out_path) and debug_dir:
                 shutil.copy2(out_path, debug_dir / "04_quadrangulation.obj")
-            if path.isfile(out_smooth) and dbg:
+            if path.isfile(out_smooth) and debug_dir:
                 shutil.copy2(out_smooth, debug_dir / "05_quadrangulation_smooth.obj")
 
             result_path = out_smooth if (enable_smoothing and path.isfile(out_smooth)) else out_path
             result_mesh = self._import_obj(result_path)
-            log.debug(
+            log.info(
                 "[stage 3 / done]   result mesh:   vertices=%d  faces=%d  smoothed=%s",
                 len(result_mesh.vertices), len(result_mesh.faces),
                 enable_smoothing and path.isfile(out_smooth),
@@ -513,32 +637,9 @@ class QuadWild:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-        self._recompute_smooth_normals(result_mesh)
-        if dbg:
-            log.debug("[debug]  intermediate files saved to %s", debug_dir)
-
-        return trimesh.Scene({"mesh": result_mesh})
-
-    # ------------------------------------------------------------------
-    # Private — normal smoothing
-    # ------------------------------------------------------------------
-
-    def _recompute_smooth_normals(self, mesh: "trimesh.Trimesh") -> None:
-        """Compute smooth vertex normals in-place using trimesh's angle-weighted average.
-
-        Matches the ``_smooth_normals_trimesh`` approach from mesh_repair:
-        uses ``trimesh.geometry.weighted_vertex_normals`` with per-face corner
-        angles as weights, which gives smooth shading without any custom
-        accumulation logic.
-        """
-        mesh.merge_vertices(merge_tex=False, merge_norm=False)
-        mesh.vertex_normals = trimesh.geometry.weighted_vertex_normals(
-            vertex_count=len(mesh.vertices),
-            faces=mesh.faces,
-            face_normals=mesh.face_normals,
-            face_angles=mesh.face_angles,
-        )
-
+        # self._recompute_smooth_normals(result_mesh)
+        return result_mesh
+    
     # ------------------------------------------------------------------
     # Private — library loading
     # ------------------------------------------------------------------
@@ -570,28 +671,50 @@ class QuadWild:
         return qw, qp
 
     # ------------------------------------------------------------------
-    # Private — mesh I/O conversion helpers
+    # Private — helpers
     # ------------------------------------------------------------------
 
-    def _to_scene(self, mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"]) -> "trimesh.Scene":
+    def _to_scene(
+        self, 
+        mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"]
+    ) -> "trimesh.Scene":
         """Normalise any supported input type to a trimesh.Scene."""
-        if isinstance(mesh, trimesh.Scene):
+        if isinstance(mesh, Path) or isinstance(mesh, str):
+            return trimesh.load(mesh, force='scene', process=False, merge_primitives=False, skip_materials=False, maintain_order=True)
+        elif isinstance(mesh, trimesh.Scene):
             return mesh
-        if isinstance(mesh, trimesh.Trimesh):
-            return trimesh.Scene({"mesh": mesh})
-        loaded = trimesh.load(str(mesh), force="scene")
-        if isinstance(loaded, trimesh.Trimesh):
-            return trimesh.Scene({"mesh": loaded})
-        return loaded
+        elif isinstance(mesh, trimesh.Trimesh):
+            return trimesh.Scene(mesh)
+        else:
+            raise TypeError("Input must be a Trimesh or Scene")
 
-    def _to_mesh(self, scene: "trimesh.Scene") -> "trimesh.Trimesh":
+    def _to_mesh(
+        self, 
+        scene: "trimesh.Scene"
+    ) -> "trimesh.Trimesh":
         """Concatenate every Trimesh geometry in the scene into one mesh."""
-        meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not meshes:
-            raise QuadWildError("Scene contains no Trimesh geometries.")
-        if len(meshes) == 1:
-            return meshes[0].copy()
-        return trimesh.util.concatenate(meshes)
+        if isinstance(scene, trimesh.Trimesh):
+            return scene
+        elif isinstance(scene, (Path, str)):
+            loaded = trimesh.load(scene, force='mesh', process=False)
+            if isinstance(loaded, trimesh.Trimesh):
+                return loaded
+            elif isinstance(loaded, trimesh.Scene):
+                if len(loaded.geometry) == 0:
+                    raise ValueError("No geometry found in the scene.")            
+                # Use to_geometry() to correctly bake in transforms from the scene graph
+                return loaded.to_geometry() if hasattr(loaded, 'to_geometry') else loaded.dump(concatenate=True)
+            else:
+                raise TypeError(f"Loaded object is neither a Trimesh nor a Scene: {type(loaded)}")
+        elif isinstance(scene, trimesh.Scene):
+            if len(scene.geometry) == 0:
+                raise ValueError("No geometry found in the scene.")        
+            # Use to_geometry() to correctly bake in transforms from the scene graph
+            return scene.to_geometry() if hasattr(scene, 'to_geometry') else scene.dump(concatenate=True)
+        elif scene is None:
+            raise ValueError("Input cannot be None")
+        else:
+            raise TypeError(f"Input must be a Trimesh, Scene, or file path; got {type(scene)}")
 
     def _estimate_scale_factor(self, mesh: "trimesh.Trimesh", target_quad_count: int) -> float:
         """Estimate a ``scale_factor`` that targets *target_quad_count* output quads.
@@ -636,7 +759,23 @@ class QuadWild:
             for e in b_edges
         }
 
-    def _prepare_mesh(self, mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
+    def _smooth_normals(self, mesh: "trimesh.Trimesh") -> None:
+        """Compute smooth vertex normals in-place using trimesh's angle-weighted average.
+
+        Matches the ``_smooth_normals_trimesh`` approach from mesh_repair:
+        uses ``trimesh.geometry.weighted_vertex_normals`` with per-face corner
+        angles as weights, which gives smooth shading without any custom
+        accumulation logic.
+        """
+        mesh.merge_vertices(merge_tex=False, merge_norm=False)
+        mesh.vertex_normals = trimesh.geometry.weighted_vertex_normals(
+            vertex_count=len(mesh.vertices),
+            faces=mesh.faces,
+            face_normals=mesh.face_normals,
+            face_angles=mesh.face_angles,
+        )
+
+    def _preprocess_mesh(self, mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
         """Minimal mesh cleanup before handing off to the C++ solver.
 
         Mirrors QRemeshify's approach: no hole-filling.  The C++ stage
@@ -665,17 +804,17 @@ class QuadWild:
         )
 
         # 2. Remove degenerate faces
-        mesh.update_faces(mesh.nondegenerate_faces())
-        mesh.update_faces(mesh.unique_faces())
-        mesh.remove_unreferenced_vertices()
+        # mesh.update_faces(mesh.nondegenerate_faces())
+        # mesh.update_faces(mesh.unique_faces())
+        # mesh.remove_unreferenced_vertices()
 
         # Refresh caches so normals/UVs stay consistent
-        mesh._cache.clear()
+        # mesh._cache.clear()
 
         # 3. Fix normals / winding
-        trimesh.repair.fix_normals(mesh)
-        trimesh.repair.fix_winding(mesh)
-        self._recompute_smooth_normals(mesh)
+        # self._smooth_normals(mesh)
+        # trimesh.repair.fix_normals(mesh)
+        # trimesh.repair.fix_winding(mesh)
 
         if not mesh.is_watertight:
             print(
@@ -686,7 +825,7 @@ class QuadWild:
         return mesh
 
     # ------------------------------------------------------------------
-    # Private — OBJ import / export (format expected by the C++ libs)
+    # Private — IO helpers
     # ------------------------------------------------------------------
     def _import_obj(self, obj_path: str) -> "trimesh.Trimesh":
         """Parse the minimal OBJ produced by the C++ libs (``v`` + ``f`` only).
@@ -712,7 +851,7 @@ class QuadWild:
 
         return trimesh.Trimesh(
             vertices=np.array(verts, dtype=np.float64),
-            faces=np.array(faces,    dtype=np.int64),
+            faces=np.array(faces, dtype=np.int64),
             process=False,
         )
 
@@ -736,10 +875,6 @@ class QuadWild:
                 f"f {' '.join(f'{int(vi) + 1}//{fi + 1}' for vi in face)}\n"
                 for fi, face in enumerate(faces)
             )
-
-    # ------------------------------------------------------------------
-    # Private — sharp-feature export
-    # ------------------------------------------------------------------
 
     def _export_sharp(
         self,
@@ -775,6 +910,9 @@ class QuadWild:
             f.writelines(f"{c},{fi},{ei}\n" for c, fi, ei in entries)
         return len(entries)
 
+    # ------------------------------------------------------------------
+    # Private — sharp-feature export
+    # ------------------------------------------------------------------    
     def _detect_sharp_edges(
         self,
         mesh: "trimesh.Trimesh",
@@ -794,7 +932,7 @@ class QuadWild:
         ~~~~~~~~~~~~~~~~~
         When a mesh is loaded from a format that stores per-face-vertex UVs
         (OBJ, glTF, …), trimesh duplicates vertices at UV seams.  Before the
-        position-based vertex merge in ``_prepare_mesh``, those seam edges
+        position-based vertex merge in ``_preprocess_mesh``, those seam edges
         appear as boundary edges.  After merge they become regular interior
         edges.  ``pre_merge_boundary_positions`` (computed by
         ``_get_boundary_edge_positions`` on the raw mesh) lets us identify
@@ -848,7 +986,7 @@ class QuadWild:
                 added.add((fi0, ei_local))
                 n_uv += 1
             if n_uv:
-                log.debug("[sharp]  UV seam edges added: %d", n_uv)
+                log.info("[sharp]  UV seam edges added: %d", n_uv)
 
         # ── Boundary edges ────────────────────────────────────────────────────
         n_faces     = len(mesh.faces)
@@ -899,7 +1037,6 @@ class QuadWild:
     # ------------------------------------------------------------------
     # Private — C++ library calls
     # ------------------------------------------------------------------
-
     def _call_remesh_and_field(
         self,
         obj_path: str,

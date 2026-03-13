@@ -10,5 +10,5 @@ scipy>=1.10.0
 # Graph algorithms (required by trimesh.repair.fill_holes)
 networkx>=3.0
 
-# Gradio UI
-gradio>=4.0.0
+# Flask backend (for server.py HTML UI)
+flask>=3.0.0

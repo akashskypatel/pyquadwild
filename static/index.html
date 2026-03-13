@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>QuadWild — Quad Remesher</title>
+
+<!-- Three.js (r160) -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<style>
+/* ── Reset / Base ──────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0}
+
+/* ── Layout ────────────────────────────────────────────── */
+#app{display:flex;height:100vh}
+
+/* ── Left Panel ────────────────────────────────────────── */
+#left-panel{
+  width:420px;min-width:420px;display:flex;flex-direction:column;
+  background:#16213e;border-right:1px solid #0f3460;overflow:hidden;
+}
+#input-viewer-wrap{height:220px;min-height:220px;position:relative;border-bottom:1px solid #0f3460}
+#input-canvas{display:block;width:100%;height:100%}
+
+/* Upload overlay — always clickable, fades when model loaded */
+#input-upload-overlay{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  background:rgba(22,33,62,.85);cursor:pointer;z-index:5;
+  font-size:14px;color:#7a8ba6;flex-direction:column;gap:8px;
+  transition:opacity .3s;
+}
+#input-upload-overlay.loaded{opacity:0;pointer-events:none}
+#input-upload-overlay:hover{opacity:1 !important;pointer-events:auto !important}
+#input-upload-overlay svg{width:40px;height:40px;stroke:#7a8ba6;fill:none;stroke-width:1.5}
+#file-input{display:none}
+
+/* Drop overlay for the whole window */
+#drop-overlay{
+  position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+  background:rgba(233,69,96,.15);border:3px dashed #e94560;z-index:100;
+  font-size:22px;font-weight:700;color:#e94560;pointer-events:none;
+}
+#drop-overlay.active{display:flex}
+
+#controls{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px;
+  scrollbar-width:thin;scrollbar-color:#0f3460 transparent}
+
+/* Shared control styles */
+.section{border-bottom:1px solid #0f3460;padding-bottom:8px}
+.section:last-child{border-bottom:none}
+.section-title{
+  font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#e94560;
+  margin-bottom:6px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:6px;
+}
+.section-title::before{content:'▸';font-size:10px;transition:transform .2s}
+.section-title.open::before{transform:rotate(90deg)}
+.section-body{display:none;flex-direction:column;gap:6px}
+.section-body.open{display:flex}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.row label{font-size:12px;flex:1;user-select:none;min-width:100px}
+.row input[type=checkbox]{accent-color:#e94560;width:15px;height:15px}
+.row input[type=number],.row input[type=range],.row select{
+  background:#1a1a2e;color:#e0e0e0;border:1px solid #0f3460;border-radius:4px;
+  padding:3px 6px;font-size:12px;outline:none;
+}
+.row input[type=number]{width:80px}
+.row input[type=range]{flex:2;min-width:80px}
+.row select{flex:1;min-width:80px}
+.row input:focus,.row select:focus{border-color:#e94560}
+.slider-num{width:62px;flex-shrink:0;background:#1a1a2e;color:#e0e0e0;border:1px solid #0f3460;border-radius:4px;padding:2px 5px;font-size:12px;outline:none;text-align:right}
+.slider-num:focus{border-color:#e94560}
+.slider-reset{background:none;border:1px solid #0f3460;border-radius:3px;color:#7a8ba6;font-size:10px;line-height:1;padding:2px 4px;cursor:pointer;flex-shrink:0;transition:border-color .15s,color .15s}
+.slider-reset:hover{border-color:#e94560;color:#e94560}
+
+/* Buttons */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;
+  padding:8px 14px;border:none;border-radius:6px;
+  font-size:13px;font-weight:600;cursor:pointer;transition:background .2s;width:100%;
+}
+.btn-primary{background:#e94560;color:#fff}
+.btn-primary:hover{background:#c73651}
+.btn-primary:disabled{background:#555;cursor:not-allowed}
+
+#remesh-btn{margin-top:4px}
+#status{font-size:11px;color:#7a8ba6;text-align:center;min-height:16px;margin-top:2px}
+
+/* Viewer controls bar */
+.viewer-bar{
+  display:flex;gap:8px;padding:4px 8px;background:#0f1a30;align-items:center;
+  font-size:11px;border-bottom:1px solid #0f3460;flex-wrap:wrap;
+}
+.viewer-bar label{user-select:none;cursor:pointer}
+.viewer-bar input[type=checkbox]{accent-color:#e94560;width:13px;height:13px;margin-right:2px}
+.viewer-bar select{
+  background:#1a1a2e;color:#e0e0e0;border:1px solid #0f3460;border-radius:3px;
+  padding:1px 4px;font-size:11px;outline:none;
+}
+.viewer-bar .spacer{flex:1}
+
+/* ── Right Panel ───────────────────────────────────────── */
+#right-panel{flex:1;display:flex;flex-direction:column;position:relative;overflow:hidden}
+#output-canvas-wrap{flex:1;position:relative;overflow:hidden}
+
+/* ── Stats bar ──────────────────────────────────────────── */
+#output-stats{
+  display:none;flex-wrap:wrap;gap:0;
+  background:#0a1628;border-top:1px solid #0f3460;
+  padding:6px 14px;
+}
+.stat-block{
+  display:flex;flex-direction:column;align-items:center;
+  padding:4px 18px;border-right:1px solid #0f3460;
+  min-width:80px;
+}
+.stat-block:last-child{border-right:none}
+.stat-label{font-size:10px;color:#5a7a9a;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px}
+.stat-value{font-size:15px;font-weight:600;color:#e0e0e0;font-variant-numeric:tabular-nums}
+#output-canvas{display:block;width:100%;height:100%}
+
+/* ── Spinner overlay ───────────────────────────────────── */
+#spinner-overlay{
+  position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  background:rgba(26,26,46,.8);z-index:20;
+}
+#spinner-overlay.visible{display:flex}
+.spinner{
+  width:48px;height:48px;border:4px solid #0f3460;border-top-color:#e94560;
+  border-radius:50%;animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <!-- Global drop overlay -->
+  <div id="drop-overlay">Drop mesh file here</div>
+
+  <!-- ════ LEFT PANEL ════ -->
+  <div id="left-panel">
+    <!-- Input 3D viewer -->
+    <div id="input-viewer-wrap">
+      <canvas id="input-canvas"></canvas>
+      <div id="input-upload-overlay">
+        <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M20 16v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2"/></svg>
+        <span>Click or drop a mesh file</span>
+        <span style="font-size:11px;color:#555">(.glb .gltf .obj .stl .ply .off)</span>
+      </div>
+      <input type="file" id="file-input" accept=".glb,.gltf,.obj,.stl,.ply,.off"/>
+    </div>
+
+    <!-- Input viewer bar -->
+    <div class="viewer-bar">
+      <label><input type="checkbox" id="input-wireframe"> Wire</label>
+      <label>Mat:</label>
+      <select id="input-material">
+        <option value="default" selected>Default</option>
+        <option value="matcap">Matcap</option>
+        <option value="normal">Normal</option>
+      </select>
+      <span class="spacer"></span>
+      <span id="input-info" style="color:#7a8ba6"></span>
+    </div>
+
+    <!-- Settings -->
+    <div id="controls">
+
+      <!-- Basic Settings -->
+      <div class="section">
+        <div class="section-title open" onclick="toggleSection(this)">Basic Settings</div>
+        <div class="section-body open">
+          <div class="row"><label>Preprocess</label><input type="checkbox" id="enable_preprocess" checked></div>
+          <div class="row"><label>Smoothing</label><input type="checkbox" id="enable_smoothing" checked></div>
+          <div class="row"><label>Detect Sharp Features</label><input type="checkbox" id="enable_sharp" checked></div>
+          <div class="row">
+            <label>Sharp Angle (°)</label>
+            <input type="range" id="sharp_angle" min="1" max="179" step="0.5" value="35">
+            <input type="number" class="slider-num" id="sharp_angle_val" min="1" max="179" step="0.5" value="35">
+            <button class="slider-reset" data-target="sharp_angle" title="Reset to default">↺</button>
+          </div>
+          <div class="row">
+            <label>Target Quad Count</label>
+            <input type="number" id="target_quad_count" value="0" min="0" step="1">
+          </div>
+          <div class="row">
+            <label>Scale Factor</label>
+            <input type="range" id="scale_factor" min="0.1" max="5" step="0.05" value="1">
+            <input type="number" class="slider-num" id="scale_factor_val" min="0.1" max="5" step="0.05" value="1">
+            <button class="slider-reset" data-target="scale_factor" title="Reset to default">↺</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ILP Objective -->
+      <div class="section">
+        <div class="section-title" onclick="toggleSection(this)">ILP Objective</div>
+        <div class="section-body">
+          <div class="row">
+            <label>Alpha</label>
+            <input type="range" id="alpha" min="0" max="0.999" step="0.001" value="0.005">
+            <input type="number" class="slider-num" id="alpha_val" min="0" max="0.999" step="0.001" value="0.005">
+            <button class="slider-reset" data-target="alpha" title="Reset to default">↺</button>
+          </div>
+          <div class="row">
+            <label>ILP Method</label>
+            <select id="ilp_method"><option value="LEASTSQUARES" selected>LEASTSQUARES</option><option value="ABS">ABS</option></select>
+          </div>
+          <div class="row"><label>Time Limit (s)</label><input type="number" id="time_limit" value="200" min="1" step="1"></div>
+          <div class="row"><label>Gap Limit</label><input type="number" id="gap_limit" value="0" min="0" step="0.0001"></div>
+          <div class="row"><label>Minimum Gap</label><input type="number" id="minimum_gap" value="0.4" min="0" step="0.0001"></div>
+        </div>
+      </div>
+
+      <!-- Regularity & Alignment -->
+      <div class="section">
+        <div class="section-title" onclick="toggleSection(this)">Regularity &amp; Alignment</div>
+        <div class="section-body">
+          <div class="row"><label>Isometry</label><input type="checkbox" id="isometry" checked></div>
+          <div class="row"><label>Regularity Quads</label><input type="checkbox" id="regularity_quads" checked></div>
+          <div class="row"><label>Regularity Non-Quads</label><input type="checkbox" id="regularity_non_quads" checked></div>
+          <div class="row">
+            <label>Non-Quads Weight</label>
+            <input type="range" id="regularity_non_quads_weight" min="0" max="1" step="0.01" value="0.9">
+            <input type="number" class="slider-num" id="regularity_non_quads_weight_val" min="0" max="1" step="0.01" value="0.9">
+            <button class="slider-reset" data-target="regularity_non_quads_weight" title="Reset to default">↺</button>
+          </div>
+          <div class="row"><label>Hard Parity Constraint</label><input type="checkbox" id="hard_parity_constraint" checked></div>
+          <div class="row"><label>Align Singularities</label><input type="checkbox" id="align_singularities" checked></div>
+          <div class="row">
+            <label>Singularity Weight</label>
+            <input type="range" id="align_singularities_weight" min="0" max="1" step="0.01" value="0.1">
+            <input type="number" class="slider-num" id="align_singularities_weight_val" min="0" max="1" step="0.01" value="0.1">
+            <button class="slider-reset" data-target="align_singularities_weight" title="Reset to default">↺</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Constraint Recovery -->
+      <div class="section">
+        <div class="section-title" onclick="toggleSection(this)">Constraint Recovery</div>
+        <div class="section-body">
+          <div class="row"><label>Repeat Iterations</label><input type="checkbox" id="repeat_losing_iterations" checked></div>
+          <div class="row"><label>Repeat Quads</label><input type="checkbox" id="repeat_losing_quads"></div>
+          <div class="row"><label>Repeat Non-Quads</label><input type="checkbox" id="repeat_losing_non_quads"></div>
+          <div class="row"><label>Repeat Align</label><input type="checkbox" id="repeat_losing_align" checked></div>
+        </div>
+      </div>
+
+      <!-- Solver Presets -->
+      <div class="section">
+        <div class="section-title" onclick="toggleSection(this)">Solver Presets</div>
+        <div class="section-body">
+          <div class="row">
+            <label>Flow Config</label>
+            <select id="flow_config"><option value="SIMPLE" selected>SIMPLE</option><option value="HALF">HALF</option></select>
+          </div>
+          <div class="row">
+            <label>Satsuma Config</label>
+            <select id="satsuma_config">
+              <option value="LEMON" selected>LEMON</option><option value="DEFAULT">DEFAULT</option>
+              <option value="MST">MST</option><option value="ROUND2EVEN">ROUND2EVEN</option>
+              <option value="SYMMDC">SYMMDC</option><option value="EDGETHRU">EDGETHRU</option>
+              <option value="NODETHRU">NODETHRU</option>
+            </select>
+          </div>
+          <div class="row"><label>Fixed Chart Clusters</label><input type="number" id="fixed_chart_clusters" value="0" min="0" step="1"></div>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="remesh-btn" disabled>Remesh</button>
+      <div id="status"></div>
+    </div>
+  </div>
+
+  <!-- ════ RIGHT PANEL ════ -->
+  <div id="right-panel">
+    <div class="viewer-bar">
+      <label><input type="checkbox" id="output-wireframe"> Wire</label>
+      <label>Mat:</label>
+      <select id="output-material">
+        <option value="default" selected>Default</option>
+        <option value="matcap">Matcap</option>
+        <option value="normal">Normal</option>
+      </select>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" id="download-btn" style="width:auto;padding:3px 10px;font-size:11px;display:none">Download .glb</button>
+    </div>
+    <div id="output-canvas-wrap">
+      <canvas id="output-canvas"></canvas>
+      <div id="spinner-overlay"><div class="spinner"></div></div>
+    </div>
+    <div id="output-stats">
+      <div class="stat-block"><span class="stat-label">Meshes</span><span class="stat-value" id="stat-geoms">—</span></div>
+      <div class="stat-block"><span class="stat-label">Vertices</span><span class="stat-value" id="stat-verts">—</span></div>
+      <div class="stat-block"><span class="stat-label">Faces</span><span class="stat-value" id="stat-faces">—</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+/* ═══════════════════════════════════════════════════════════
+   Section accordion
+   ═══════════════════════════════════════════════════════════ */
+window.toggleSection = function(titleEl) {
+  titleEl.classList.toggle('open');
+  titleEl.nextElementSibling.classList.toggle('open');
+};
+
+/* ═══════════════════════════════════════════════════════════
+   Slider live-display wiring
+   ═══════════════════════════════════════════════════════════ */
+document.querySelectorAll('input[type=range]').forEach(sl => {
+  const numInput = document.getElementById(sl.id + '_val');
+  if (!numInput) return;
+  const decimals = sl.step.includes('.') ? (sl.step.split('.')[1]||'').length : 0;
+  const clamp = v => Math.min(parseFloat(sl.max), Math.max(parseFloat(sl.min), v));
+  // slider -> number box
+  sl.addEventListener('input', () => { numInput.value = parseFloat(sl.value).toFixed(decimals); });
+  // number box -> slider (on blur or Enter)
+  numInput.addEventListener('change', () => {
+    const v = clamp(parseFloat(numInput.value) || 0);
+    sl.value = v;
+    numInput.value = v.toFixed(decimals);
+  });
+  // init
+  numInput.value = parseFloat(sl.value).toFixed(decimals);
+  // reset button
+  const resetBtn = sl.parentElement.querySelector('.slider-reset[data-target="' + sl.id + '"]');
+  if (resetBtn) {
+    const defaultVal = sl.defaultValue;
+    resetBtn.addEventListener('click', () => {
+      sl.value = defaultVal;
+      numInput.value = parseFloat(defaultVal).toFixed(decimals);
+    });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════
+   GLTF Loader (shared)
+   ═══════════════════════════════════════════════════════════ */
+const gltfLoader = new GLTFLoader();
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/');
+gltfLoader.setDRACOLoader(dracoLoader);
+
+/* ═══════════════════════════════════════════════════════════
+   Three.js Viewer — factory
+   ═══════════════════════════════════════════════════════════ */
+function createViewer(canvasId, wrapId) {
+  const canvas = document.getElementById(canvasId);
+  const wrap = wrapId ? document.getElementById(wrapId) : canvas.parentElement;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color('#1a1a2e');
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+  camera.position.set(2, 1.5, 3);
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.NoToneMapping;
+
+  const pmremGenerator = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+  scene.environmentIntensity = 1.5;
+
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0, 0, 0);
+
+  /* Lights — same 6-direction dome as glb_viewer */
+  const lightsGroup = new THREE.Group();
+  scene.add(lightsGroup);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0xaaaaaa, 2.0);
+  const ambient = new THREE.AmbientLight(0xffffff, 1.0);
+  const mainLight = new THREE.DirectionalLight(0xffffff, 2.0);
+  mainLight.position.set(5, 10, 5);
+  const lightTop = new THREE.DirectionalLight(0xffffff, 2.0);
+  lightTop.position.set(0, 10, 0);
+  const lightBottom = new THREE.DirectionalLight(0xffffff, 1.0);
+  lightBottom.position.set(0, -10, 0);
+  const lightFront = new THREE.DirectionalLight(0xffffff, 1.5);
+  lightFront.position.set(0, 0, 10);
+  const lightBack = new THREE.DirectionalLight(0xffffff, 1.5);
+  lightBack.position.set(0, 0, -10);
+  const lightLeft = new THREE.DirectionalLight(0xffffff, 1.5);
+  lightLeft.position.set(-10, 0, 0);
+  const lightRight = new THREE.DirectionalLight(0xffffff, 1.5);
+  lightRight.position.set(10, 0, 0);
+  lightsGroup.add(hemi, ambient, mainLight, lightTop, lightBottom, lightFront, lightBack, lightLeft, lightRight);
+
+  /* Resize handler */
+  function resize() {
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    if (w === 0 || h === 0) return;
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* Render loop */
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  return { scene, camera, renderer, controls, canvas, wrap, resize,
+           currentModel: null, originalMaterials: new Map() };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Dispose & Load GLB into a viewer
+   ═══════════════════════════════════════════════════════════ */
+function disposeModel(v) {
+  if (!v.currentModel) return;
+  v.currentModel.traverse(child => {
+    if (child.isMesh) {
+      child.geometry?.dispose();
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach(m => {
+        if (!m) return;
+        for (const key of Object.keys(m)) {
+          const val = m[key];
+          if (val && typeof val.dispose === 'function') val.dispose();
+        }
+        m.dispose();
+      });
+    }
+  });
+  v.scene.remove(v.currentModel);
+  v.currentModel = null;
+  v.originalMaterials.clear();
+}
+
+function loadGlb(viewer, blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    gltfLoader.load(url, (gltf) => {
+      URL.revokeObjectURL(url);
+      disposeModel(viewer);
+
+      const model = gltf.scene;
+      viewer.scene.add(model);
+      viewer.currentModel = model;
+
+      /* Store original materials */
+      model.traverse(ch => {
+        if (ch.isMesh) viewer.originalMaterials.set(ch, ch.material);
+      });
+
+      /* Bounding & framing */
+      const box = new THREE.Box3().setFromObject(model);
+      const center = box.getCenter(new THREE.Vector3());
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      model.position.sub(center);
+      sphere.center.set(0, 0, 0);
+
+      const radius = sphere.radius || 1;
+      const dist = radius * 2.5;
+      viewer.camera.near = Math.max(0.01, radius / 100);
+      viewer.camera.far = radius * 200;
+      viewer.camera.position.set(dist * 0.7, dist * 0.5, dist * 0.7);
+      viewer.camera.updateProjectionMatrix();
+      viewer.controls.target.set(0, 0, 0);
+      viewer.controls.update();
+
+      /* Count verts/faces */
+      let totalVerts = 0, totalFaces = 0, meshCount = 0;
+      model.traverse(ch => {
+        if (ch.isMesh && ch.geometry) {
+          meshCount++;
+          totalVerts += ch.geometry.attributes.position ? ch.geometry.attributes.position.count : 0;
+          totalFaces += ch.geometry.index ? ch.geometry.index.count / 3 : (ch.geometry.attributes.position ? ch.geometry.attributes.position.count / 3 : 0);
+        }
+      });
+
+      resolve({ verts: totalVerts, faces: Math.round(totalFaces), geoms: meshCount });
+    },
+    undefined,
+    (err) => { URL.revokeObjectURL(url); reject(err); });
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Visualization controls (same approach as glb_viewer)
+   ═══════════════════════════════════════════════════════════ */
+function applyWireframe(v, on) {
+  if (!v.currentModel) return;
+  v.currentModel.traverse(ch => {
+    if (!ch.isMesh) return;
+    const mats = Array.isArray(ch.material) ? ch.material : [ch.material];
+    mats.forEach(m => { if (m) m.wireframe = on; });
+  });
+}
+
+function applyMaterial(v, mode, wireframe) {
+  if (!v.currentModel) return;
+  v.currentModel.traverse(ch => {
+    if (!ch.isMesh) return;
+    const orig = v.originalMaterials.get(ch);
+    if (mode === 'default') {
+      ch.material = orig;
+    } else if (mode === 'normal') {
+      ch.material = new THREE.MeshNormalMaterial({ wireframe });
+    } else if (mode === 'matcap') {
+      ch.material = new THREE.MeshMatcapMaterial({ color: 0xcccccc, wireframe });
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Init both viewers
+   ═══════════════════════════════════════════════════════════ */
+const inputViewer  = createViewer('input-canvas', 'input-viewer-wrap');
+const outputViewer = createViewer('output-canvas', 'output-canvas-wrap');
+
+/* Wire up input viewer controls */
+const inputWireCb  = document.getElementById('input-wireframe');
+const inputMatSel  = document.getElementById('input-material');
+inputWireCb.addEventListener('change', () => {
+  applyWireframe(inputViewer, inputWireCb.checked);
+});
+inputMatSel.addEventListener('change', () => {
+  applyMaterial(inputViewer, inputMatSel.value, inputWireCb.checked);
+  applyWireframe(inputViewer, inputWireCb.checked);
+});
+
+/* Wire up output viewer controls */
+const outputWireCb = document.getElementById('output-wireframe');
+const outputMatSel = document.getElementById('output-material');
+outputWireCb.addEventListener('change', () => {
+  applyWireframe(outputViewer, outputWireCb.checked);
+});
+outputMatSel.addEventListener('change', () => {
+  applyMaterial(outputViewer, outputMatSel.value, outputWireCb.checked);
+  applyWireframe(outputViewer, outputWireCb.checked);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   File upload — click + drag-and-drop (always re-uploadable)
+   ═══════════════════════════════════════════════════════════ */
+let uploadedFile = null;
+let lastOutputBlob = null;
+
+const fileInput     = document.getElementById('file-input');
+const uploadOverlay = document.getElementById('input-upload-overlay');
+const dropOverlay   = document.getElementById('drop-overlay');
+const inputInfoEl   = document.getElementById('input-info');
+const remeshBtn     = document.getElementById('remesh-btn');
+
+/* Click on the overlay (or hover-reveal after first load) opens file picker */
+uploadOverlay.addEventListener('click', () => fileInput.click());
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length > 0) handleFile(fileInput.files[0]);
+});
+
+/* Global drag-and-drop */
+let dragCounter = 0;
+document.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dropOverlay.classList.add('active'); });
+document.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.remove('active'); } });
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.classList.remove('active');
+  const file = e.dataTransfer?.files?.[0];
+  if (file) handleFile(file);
+});
+
+async function handleFile(file) {
+  uploadedFile = file;
+  uploadOverlay.classList.add('loaded'); // semi-hide, still hoverable
+  remeshBtn.disabled = false;
+  inputInfoEl.textContent = 'Loading…';
+
+  /* Convert to GLB for the Three.js viewer */
+  const ext = file.name.split('.').pop().toLowerCase();
+  let blob;
+  if (ext === 'glb') {
+    blob = file;
+  } else {
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const resp = await fetch('/convert_to_glb', { method: 'POST', body: fd });
+      if (!resp.ok) throw new Error(await resp.text());
+      blob = await resp.blob();
+    } catch (e) {
+      inputInfoEl.textContent = 'Preview failed: ' + e.message;
+      return;
+    }
+  }
+
+  try {
+    const info = await loadGlb(inputViewer, blob);
+    inputInfoEl.textContent = `${info.geoms} mesh${info.geoms > 1 ? 'es' : ''} · ${info.verts.toLocaleString()}v · ${info.faces.toLocaleString()}f`;
+    applyMaterial(inputViewer, inputMatSel.value, inputWireCb.checked);
+    applyWireframe(inputViewer, inputWireCb.checked);
+    inputViewer.resize();
+  } catch (e) {
+    inputInfoEl.textContent = 'Load error: ' + e.message;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Remesh — send to backend
+   ═══════════════════════════════════════════════════════════ */
+const statusEl     = document.getElementById('status');
+const spinnerEl    = document.getElementById('spinner-overlay');
+const downloadBtn  = document.getElementById('download-btn');
+const outputStats  = document.getElementById('output-stats');
+const statGeoms    = document.getElementById('stat-geoms');
+const statVerts    = document.getElementById('stat-verts');
+const statFaces    = document.getElementById('stat-faces');
+
+function getSettings() {
+  const val = id => document.getElementById(id).value;
+  const chk = id => document.getElementById(id).checked;
+  const num = id => parseFloat(document.getElementById(id).value);
+  return {
+    enable_preprocess: chk('enable_preprocess'),
+    enable_sharp: chk('enable_sharp'),
+    sharp_angle: num('sharp_angle'),
+    enable_smoothing: chk('enable_smoothing'),
+    scale_factor: num('scale_factor'),
+    target_quad_count: parseInt(val('target_quad_count')) || 0,
+    alpha: num('alpha'),
+    ilp_method: val('ilp_method'),
+    time_limit: parseInt(val('time_limit')) || 200,
+    gap_limit: num('gap_limit'),
+    minimum_gap: num('minimum_gap'),
+    isometry: chk('isometry'),
+    regularity_quads: chk('regularity_quads'),
+    regularity_non_quads: chk('regularity_non_quads'),
+    regularity_non_quads_weight: num('regularity_non_quads_weight'),
+    align_singularities: chk('align_singularities'),
+    align_singularities_weight: num('align_singularities_weight'),
+    repeat_losing_iterations: chk('repeat_losing_iterations'),
+    repeat_losing_quads: chk('repeat_losing_quads'),
+    repeat_losing_non_quads: chk('repeat_losing_non_quads'),
+    repeat_losing_align: chk('repeat_losing_align'),
+    hard_parity_constraint: chk('hard_parity_constraint'),
+    fixed_chart_clusters: parseInt(val('fixed_chart_clusters')) || 0,
+    flow_config: val('flow_config'),
+    satsuma_config: val('satsuma_config'),
+  };
+}
+
+remeshBtn.addEventListener('click', async () => {
+  if (!uploadedFile) return;
+  remeshBtn.disabled = true;
+  spinnerEl.classList.add('visible');
+  statusEl.textContent = 'Remeshing…';
+  downloadBtn.style.display = 'none';
+
+  const fd = new FormData();
+  fd.append('file', uploadedFile);
+  fd.append('settings', JSON.stringify(getSettings()));
+
+  try {
+    const resp = await fetch('/remesh', { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error(await resp.text());
+    const blob = await resp.blob();
+    lastOutputBlob = blob;
+
+    const info = await loadGlb(outputViewer, blob);
+    statGeoms.textContent = info.geoms.toLocaleString();
+    statVerts.textContent = info.verts.toLocaleString();
+    statFaces.textContent = info.faces.toLocaleString();
+    outputStats.style.display = 'flex';
+    statusEl.textContent = 'Done.';
+    downloadBtn.style.display = '';
+
+    applyMaterial(outputViewer, outputMatSel.value, outputWireCb.checked);
+    applyWireframe(outputViewer, outputWireCb.checked);
+    outputViewer.resize();
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+    outputStats.style.display = 'none';
+    statGeoms.textContent = statVerts.textContent = statFaces.textContent = '—';
+  } finally {
+    spinnerEl.classList.remove('visible');
+    remeshBtn.disabled = false;
+  }
+});
+
+/* Download result */
+downloadBtn.addEventListener('click', () => {
+  if (!lastOutputBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(lastOutputBlob);
+  const stem = uploadedFile ? uploadedFile.name.replace(/\.[^.]+$/, '') : 'mesh';
+  a.download = stem + '_remeshed.glb';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+</script>
+</body>
+</html>
