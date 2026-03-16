@@ -24,8 +24,10 @@ Dependencies
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
+import os
 import platform
 import shutil
 import tempfile
@@ -518,6 +520,17 @@ class QuadWild:
             len(mesh.vertices), len(mesh.faces), mesh.is_watertight,
         )
 
+        if not mesh.is_watertight:
+            if enable_preprocess:
+                log.debug(
+                    "[stage 0 / input]  mesh is not watertight — remeshAndField2 will repair it"
+                )
+            else:
+                log.warning(
+                    "[stage 0 / input]  mesh is not watertight and Preprocess is disabled — "
+                    "consider enabling Preprocess so remeshAndField2 can repair the mesh"
+                )
+
         current_scale_factor = scale_factor
         if target_quad_count is not None and target_quad_count > 0:
             current_scale_factor = self._estimate_scale_factor(mesh, target_quad_count)
@@ -648,6 +661,7 @@ class QuadWild:
         _LIB_NAMES = {
             "Windows": ("lib_quadwild.dll", "lib_quadpatches.dll"),
             "Darwin":  ("liblib_quadwild.dylib", "liblib_quadpatches.dylib"),
+            "Linux":   ("liblib_quadwild.so", "liblib_quadpatches.so"),
         }
         qw_name, qp_name = _LIB_NAMES.get(
             platform.system(), ("liblib_quadwild.so", "liblib_quadpatches.so"),
@@ -817,9 +831,9 @@ class QuadWild:
         # trimesh.repair.fix_winding(mesh)
 
         if not mesh.is_watertight:
-            print(
+            logging.warning(
                 "[QuadWild] Warning: mesh is not watertight — "
-                "enable 'Preprocess' so remeshAndField2 can repair it."
+                "remeshAndField will attempt to repair it."
             )
 
         return mesh
@@ -1037,6 +1051,31 @@ class QuadWild:
     # ------------------------------------------------------------------
     # Private — C++ library calls
     # ------------------------------------------------------------------
+    # Private — C++ output suppression
+    # ------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _suppress_c_output(self):
+        """Redirect C-level stdout and stderr to /dev/null for the duration.
+
+        Python's sys.stdout redirect is insufficient because the C++ shared
+        libraries write directly to file descriptors 1 and 2.  We dup the
+        originals, point the fds at /dev/null, then restore on exit.
+        """
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_fds = {}
+        try:
+            for fd in (1, 2):
+                saved = os.dup(fd)
+                saved_fds[fd] = saved
+                os.dup2(devnull_fd, fd)
+            yield
+        finally:
+            os.close(devnull_fd)
+            for fd, saved in saved_fds.items():
+                os.dup2(saved, fd)
+                os.close(saved)
+
+    # ------------------------------------------------------------------
     def _call_remesh_and_field(
         self,
         obj_path: str,
@@ -1057,12 +1096,13 @@ class QuadWild:
             hasField=False,
         )
         try:
-            self._qw.remeshAndField2(
-                byref(params),
-                obj_path.encode(),
-                sharp_path.encode(),
-                field_path.encode(),
-            )
+            with (contextlib.nullcontext() if log.isEnabledFor(logging.DEBUG) else self._suppress_c_output()):
+                self._qw.remeshAndField2(
+                    byref(params),
+                    obj_path.encode(),
+                    sharp_path.encode(),
+                    field_path.encode(),
+                )
         except Exception as exc:
             raise QuadWildError("remeshAndField2 failed") from exc
 
@@ -1073,7 +1113,8 @@ class QuadWild:
         ``.obj`` and writes the traced patch file as ``<base>_p0.obj``.
         """
         try:
-            ok = self._qw.trace2(remeshed_base.encode())
+            with (contextlib.nullcontext() if log.isEnabledFor(logging.DEBUG) else self._suppress_c_output()):
+                ok = self._qw.trace2(remeshed_base.encode())
         except Exception as exc:
             raise QuadWildError("trace2 failed") from exc
         if not ok:
@@ -1163,13 +1204,14 @@ class QuadWild:
         p.callbackGapLimit                  = cb_gap_arr
 
         try:
-            result = self._qp.quadPatches(
-                traced_path.encode(),
-                byref(p),
-                c_float(scale_factor),
-                c_int(fixed_chart_clusters),
-                c_bool(enable_smoothing),
-            )
+            with (contextlib.nullcontext() if log.isEnabledFor(logging.DEBUG) else self._suppress_c_output()):
+                result = self._qp.quadPatches(
+                    traced_path.encode(),
+                    byref(p),
+                    c_float(scale_factor),
+                    c_int(fixed_chart_clusters),
+                    c_bool(enable_smoothing),
+                )
         except Exception as exc:
             raise QuadWildError("quadPatches failed") from exc
 
