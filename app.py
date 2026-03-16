@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import tempfile
 from pathlib import Path
 
 from flask import Flask, request, send_file, send_from_directory
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
 
 import trimesh
 
@@ -77,7 +83,7 @@ def remesh():
 
         tqc = int(s.get("target_quad_count", 0))
 
-        result = _qw.process(
+        result = _qw.remesh(
             scene,
             enable_preprocess=s.get("enable_preprocess", True),
             enable_sharp=s.get("enable_sharp", True),
@@ -106,6 +112,7 @@ def remesh():
             repeat_losing_align=s.get("repeat_losing_align", True),
             hard_parity_constraint=s.get("hard_parity_constraint", True),
             fixed_chart_clusters=int(s.get("fixed_chart_clusters", 0)),
+            merge_geometries=s.get("merge_geometries", False),
             flow_config=s.get("flow_config", "SIMPLE"),
             satsuma_config=s.get("satsuma_config", "LEMON"),
         )
