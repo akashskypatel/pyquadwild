@@ -157,14 +157,12 @@ class QuadWild:
         * macOS   → ``liblib_quadwild.dylib``, ``liblib_quadpatches.dylib``
         * Windows → ``lib_quadwild.dll``, ``lib_quadpatches.dll``
 
-        Defaults to a ``libs/`` folder one level above this file
-        (i.e. ``<repo_root>/libs/``).
+        Defaults to the ``libs/`` folder alongside this file.
 
     config_dir:
         Directory containing the ``main_config/`` and ``satsuma/``
         sub-directories with the JSON solver-configuration files.
-        Defaults to a ``config/`` folder one level above this file
-        (i.e. ``<repo_root>/config/``).
+        Defaults to the ``config/`` folder alongside this file.
 
     Raises
     ------
@@ -178,8 +176,8 @@ class QuadWild:
         config_dir: Optional[Union[str, Path]] = None,
     ) -> None:
         here = Path(__file__).parent
-        self._libs_dir   = Path(libs_dir)   if libs_dir   else here.parent / "libs"
-        self._config_dir = Path(config_dir) if config_dir else here.parent / "config"
+        self._libs_dir   = Path(libs_dir)   if libs_dir   else here / "libs"
+        self._config_dir = Path(config_dir) if config_dir else here / "config"
 
         _LIB_NAMES = {
             "Windows": ("lib_quadwild.dll",       "lib_quadpatches.dll"),

@@ -21,7 +21,7 @@ logging.basicConfig(
 
 import trimesh
 
-from src.quadwild import QuadWild, QuadWildError
+from pyquadwild import QuadWild, QuadWildError
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 

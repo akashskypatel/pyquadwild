@@ -10,15 +10,6 @@ Given any triangulated 3-D mesh, it produces a clean quad-dominant mesh by runni
 
 ---
 
-## Credits & Acknowledgements
-
-This project is built on top of two excellent open-source works:
-
-- **[quadwild-bimdf](https://github.com/cgg-bern/quadwild-bimdf)** — the core C++ library for cross-field computation, quadrangulation tracing, and ILP-based quad patching. Published by the Computer Graphics Group, University of Bern.
-- **[QRemeshify](https://github.com/ksami/QRemeshify)** — an inspiration and reference for bridging QuadWild's C++ pipeline into a Python-friendly interface.
-
----
-
 ## Requirements
 
 - Python 3.9+
@@ -160,12 +151,15 @@ Opens a local web UI where you can upload a mesh, adjust all parameters interact
 
 ```
 pyquadwild/
+├── pyproject.toml
+├── MANIFEST.in
 ├── app.py              # Gradio web demo
 ├── requirements.txt
-├── src/
-│   └── quadwild.py     # QuadWild Python class (ctypes bindings)
-├── libs/               # Pre-compiled C++ shared libraries (not tracked by git)
-└── config/
+└── pyquadwild/
+    ├── __init__.py
+    ├── quadwild.py     # QuadWild Python class (ctypes bindings)
+    ├── libs/           # Pre-compiled C++ shared libraries 
+    └── config/         # JSON config files for the solvers
     ├── main_config/    # Flow solver configuration files
     └── satsuma/        # Satsuma matching preset files
 ```
@@ -175,3 +169,14 @@ pyquadwild/
 ## License
 
 See [LICENSE](LICENSE) for details.
+
+---
+
+## Credits & Acknowledgements
+
+This project is built on top of excellent open-source works:
+
+- **[quadwild-bimdf](https://github.com/cgg-bern/quadwild-bimdf)** — the core C++ library for cross-field computation, quadrangulation tracing, and ILP-based quad patching. Published by the Computer Graphics Group, University of Bern.
+- **[QRemeshify](https://github.com/ksami/QRemeshify)** — an inspiration and reference for bridging QuadWild's C++ pipeline into a Python-friendly interface.
+- **[pyquadwild (PozzettiAndrea)](https://github.com/PozzettiAndrea/pyquadwild)** — Another helpful reference repository.
+- **QuadWild** — Pietroni et al., "Reliable Feature-Line Driven Quad-Remeshing" (SIGGRAPH 2021)
