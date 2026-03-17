@@ -1,4 +1,4 @@
-# quadwild-python
+# pyquadwild
 
 A Python wrapper for the [QuadWild + Bi-MDF](https://github.com/cgg-bern/quadwild-bimdf) C++ quad-remeshing pipeline, with an optional [Gradio](https://www.gradio.app/) web demo.
 
@@ -67,7 +67,8 @@ qw = QuadWild()  # loads libs/ and config/ from the repo root by default
 
 scene = trimesh.load("my_mesh.obj", force="scene")
 
-result = qw.process(
+# Returns a trimesh.Scene containing the quad-remeshed geometry
+result = qw.remesh(
     scene,
     enable_preprocess=True,
     enable_sharp=True,
@@ -79,6 +80,12 @@ result = qw.process(
 result.export("output_quad.glb")
 ```
 
+To get raw vertex and face arrays instead of a scene:
+
+```python
+vertices, faces = qw.quadrangulate(scene)
+```
+
 Custom library and config paths:
 
 ```python
@@ -88,7 +95,7 @@ qw = QuadWild(
 )
 ```
 
-`process()` accepts a file path (`str` / `Path`), a `trimesh.Trimesh`, or a `trimesh.Scene`. Multi-geometry scenes are merged before processing.
+Both `remesh()` and `quadrangulate()` accept a file path (`str` / `Path`), a `trimesh.Trimesh`, or a `trimesh.Scene`. Scenes with multiple geometries are processed per-geometry by default; pass `merge_geometries=True` to merge them into a single mesh first.
 
 ### Gradio Web Demo
 
@@ -152,7 +159,7 @@ Opens a local web UI where you can upload a mesh, adjust all parameters interact
 ## Project Structure
 
 ```
-quadwild-python/
+pyquadwild/
 ├── app.py              # Gradio web demo
 ├── requirements.txt
 ├── src/

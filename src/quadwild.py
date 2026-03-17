@@ -1,11 +1,11 @@
 """quadwild.py — Standalone Python wrapper for QuadWild + Bi-MDF quad-remesher.
 
-Exposes a single class :class:`QuadWild` with two public methods:
+Exposes a single class :class:`QuadWild` with one public method:
 
-* ``__init__``     — configure paths to shared libraries and config files.
-* ``remesh``       — run the full quad-remeshing pipeline on any trimesh-compatible
-  mesh or scene, returning a :class:`trimesh.Scene`.
-* ``quadrangulate`` — run the pipeline and return raw vertex and quad-face arrays.
+* ``__init__``  — configure paths to shared libraries and config files.
+* ``remesh``    — run the full quad-remeshing pipeline on any trimesh-compatible
+  mesh or scene.  The *output_format* parameter controls the return type:
+  ``"scene"`` (default), ``"mesh"``, or ``"arrays"``.
 
 The C++ pipeline (three stages)
 --------------------------------
@@ -26,6 +26,7 @@ Dependencies
 from __future__ import annotations
 
 import contextlib
+import enum
 import logging
 import math
 import os
@@ -35,16 +36,41 @@ import tempfile
 from ctypes import (
     POINTER, Structure, byref, c_bool, c_char_p, c_double, c_float, c_int, cdll,
 )
-from os import path
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union, overload
 
 import numpy as np
 import trimesh
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
 
+__all__ = ["QuadWild", "QuadWildError", "ILPMethod", "FlowConfig", "SatsumaConfig"]
+
+
+# ---------------------------------------------------------------------------
+# Public enums
+# ---------------------------------------------------------------------------
+class ILPMethod(enum.IntEnum):
+    """ILP solver variant for stage-3 quadrangulation."""
+    LEASTSQUARES = 1
+    ABS = 2
+
+
+class FlowConfig(str, enum.Enum):
+    """Flow-solver configuration preset (path relative to *config_dir*)."""
+    SIMPLE = "main_config/flow_virtual_simple.json"
+    HALF   = "main_config/flow_virtual_half.json"
+
+
+class SatsumaConfig(str, enum.Enum):
+    """Satsuma matching configuration preset (path relative to *config_dir*)."""
+    DEFAULT    = "satsuma/default.json"
+    MST        = "satsuma/approx-mst.json"
+    ROUND2EVEN = "satsuma/approx-round2even.json"
+    SYMMDC     = "satsuma/approx-symmdc.json"
+    EDGETHRU   = "satsuma/edgethru.json"
+    LEMON      = "satsuma/lemon.json"
+    NODETHRU   = "satsuma/nodethru.json"
 
 # ---------------------------------------------------------------------------
 # ctypes mirror of the C++ parameter structs
@@ -105,36 +131,13 @@ class _QRParameters(Structure):
     ]
 
 
-# ---------------------------------------------------------------------------
-# Lookup tables
-# ---------------------------------------------------------------------------
-
-_ILP_METHODS: dict[str, int] = {
-    "LEASTSQUARES": 1,
-    "ABS": 2,
-}
-
-# Paths are relative to ``config_dir`` supplied at construction time.
-_FLOW_CONFIGS: dict[str, str] = {
-    "SIMPLE": "main_config/flow_virtual_simple.json",
-    "HALF":   "main_config/flow_virtual_half.json",
-}
-
-_SATSUMA_CONFIGS: dict[str, str] = {
-    "DEFAULT":    "satsuma/default.json",
-    "MST":        "satsuma/approx-mst.json",
-    "ROUND2EVEN": "satsuma/approx-round2even.json",
-    "SYMMDC":     "satsuma/approx-symmdc.json",
-    "EDGETHRU":   "satsuma/edgethru.json",
-    "LEMON":      "satsuma/lemon.json",
-    "NODETHRU":   "satsuma/nodethru.json",
-}
-
+# Minimum number of quads to allocate per geometry when distributing a global
+# target_quad_count across a multi-geometry scene.
+_MIN_QUADS_PER_PART: int = 50
 
 # ---------------------------------------------------------------------------
 # Public exception
 # ---------------------------------------------------------------------------
-
 class QuadWildError(RuntimeError):
     """Raised when the QuadWild pipeline fails at any stage."""
 
@@ -142,7 +145,6 @@ class QuadWildError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
-
 class QuadWild:
     """Standalone quad-remesher wrapping the QuadWild + Bi-MDF C++ libraries.
 
@@ -190,7 +192,7 @@ class QuadWild:
         qw_path, qp_path = (str(self._libs_dir / n) for n in (qw_name, qp_name))
 
         for lib_path in (qw_path, qp_path):
-            if not path.isfile(lib_path):
+            if not Path(lib_path).is_file():
                 raise QuadWildError(f"Library not found: {lib_path}")
 
         qw = cdll.LoadLibrary(qw_path)
@@ -208,6 +210,33 @@ class QuadWild:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    @overload
+    def remesh(
+        self,
+        mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
+        *,
+        output_format: Literal["scene"] = ...,
+        **kwargs,
+    ) -> "trimesh.Scene": ...
+
+    @overload
+    def remesh(
+        self,
+        mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
+        *,
+        output_format: Literal["mesh"],
+        **kwargs,
+    ) -> "trimesh.Trimesh": ...
+
+    @overload
+    def remesh(
+        self,
+        mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
+        *,
+        output_format: Literal["arrays"],
+        **kwargs,
+    ) -> tuple[np.ndarray, np.ndarray]: ...
+
     def remesh(
         self,
         mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
@@ -223,7 +252,7 @@ class QuadWild:
         fixed_chart_clusters: int = 0,
         # ILP objective
         alpha: float = 0.005,
-        ilp_method: str = "LEASTSQUARES",
+        ilp_method: ILPMethod = ILPMethod.LEASTSQUARES,
         time_limit: int = 200,
         gap_limit: float = 0.0,
         minimum_gap: float = 0.4,
@@ -239,28 +268,29 @@ class QuadWild:
         repeat_losing_align: bool = True,
         hard_parity_constraint: bool = True,
         # Solver config presets
-        flow_config: str = "SIMPLE",
-        satsuma_config: str = "LEMON",
+        flow_config: FlowConfig = FlowConfig.SIMPLE,
+        satsuma_config: SatsumaConfig = SatsumaConfig.LEMON,
         # Callback schedule (8-element lists; defaults are used when None)
         callback_time_limit: Optional[List[float]] = None,
         callback_gap_limit: Optional[List[float]] = None,
         # ── Processing strategy ────────────────────────────────────
         merge_geometries: bool = False,
+        # Output format
+        output_format: Literal["arrays", "mesh", "scene"] = "scene",
         # Diagnostics
         debug_dir: Optional[Union[str, Path]] = None,
-    ) -> "trimesh.Scene":
+    ) -> Union["trimesh.Scene", "trimesh.Trimesh", tuple[np.ndarray, np.ndarray]]:
         """Run the full QuadWild + Bi-MDF quad-remeshing pipeline.
 
-        The processing strategy is chosen automatically based on the input:
+        *output_format* controls the return type:
 
-        * A :class:`trimesh.Trimesh` or a single-geometry scene is processed
-          by :meth:`_quadrangulate_mesh` (the entire mesh in one shot).
-        * A scene with **multiple geometries** is processed by
-          :meth:`_process_scene` (each geometry independently; the original
-          scene graph is reconstructed with the remeshed geometries).
-
-        Set *merge_geometries* to ``True`` to override the automatic strategy and
-        always merge all geometries into a single mesh before processing.
+        * ``"scene"`` (default) — returns a :class:`trimesh.Scene`.  Multi-geometry
+          inputs are processed per-geometry unless *merge_geometries* is ``True``.
+        * ``"mesh"`` — returns a single :class:`trimesh.Trimesh`.  Multi-geometry
+          inputs are always merged before processing.
+        * ``"arrays"`` — returns raw ``(vertices, faces)`` numpy arrays with
+          quad faces preserved as 4-element rows.  Multi-geometry inputs are
+          always merged before processing.
 
         Parameters
         ----------
@@ -297,7 +327,7 @@ class QuadWild:
             Blend coefficient between isometry (``alpha``) and regularity
             (``1 − alpha``) in the ILP objective.  Default ``0.005``.
         ilp_method:
-            ILP solver variant — ``"LEASTSQUARES"`` or ``"ABS"``.
+            ILP solver variant.  See :data:`ILPMethod` for accepted values.
         time_limit:
             Hard time limit in seconds for the ILP solver.
         gap_limit:
@@ -306,11 +336,10 @@ class QuadWild:
         minimum_gap:
             The ILP must achieve at least this optimality gap.
         flow_config:
-            Flow-solver preset — ``"SIMPLE"`` or ``"HALF"``.
+            Flow-solver preset.  See :data:`FlowConfig` for accepted values.
         satsuma_config:
-            Satsuma matching preset — one of ``"DEFAULT"``, ``"MST"``,
-            ``"ROUND2EVEN"``, ``"SYMMDC"``, ``"EDGETHRU"``, ``"LEMON"``,
-            ``"NODETHRU"``.
+            Satsuma matching preset.  See :data:`SatsumaConfig` for accepted
+            values.
         callback_time_limit:
             8-element list of callback time checkpoints (seconds).  Uses a
             sensible default when *None*.
@@ -320,9 +349,7 @@ class QuadWild:
         debug_dir:
             Optional path to a directory where **all intermediate pipeline
             files** are copied after each stage, keeping their original names.
-            The directory is created if it does not exist.  Enabling this also
-            activates verbose ``logging.DEBUG`` output on the ``quadwild``
-            logger (name = ``__name__``).
+            The directory is created if it does not exist.
 
             Files saved (when they exist)::
 
@@ -349,7 +376,7 @@ class QuadWild:
               uses dihedral angle and boundary.  The ``01_sharp.sharp`` file
               will therefore typically contain fewer entries than Blender's.
             * **Mesh cleanup**: vertex merging, degenerate-face removal, and
-              normal fixes are currently commented out in ``_preprocess_mesh``.
+              normal fixes are currently commented out in ``_preprocess``.
               Blender's bmesh always produces a clean, consistently-wound mesh.
             * **Coordinate space**: QRemeshify strips the object's translation
               (applies only rotation + scale) so the mesh is centred near the
@@ -359,33 +386,43 @@ class QuadWild:
 
         Returns
         -------
-        trimesh.Scene
-            Quad-remeshed mesh wrapped in a :class:`trimesh.Scene` under the
-            key ``"mesh"``.
+        trimesh.Scene | trimesh.Trimesh | tuple[np.ndarray, np.ndarray]
+            Depends on *output_format*:
+
+            * ``"scene"`` → :class:`trimesh.Scene` (geometry key ``"mesh"``).
+            * ``"mesh"``  → :class:`trimesh.Trimesh`.
+            * ``"arrays"`` → ``(vertices, faces)`` numpy arrays.
 
         Raises
         ------
         QuadWildError
             If input validation fails or any pipeline stage fails.
-        ValueError
-            If an unsupported enum-style string is passed.
+        KeyError
+            If an unsupported enum name is passed as a string.
         """
-        if ilp_method not in _ILP_METHODS:
-            raise ValueError(f"ilp_method must be one of {list(_ILP_METHODS)}, got {ilp_method!r}")
-        if flow_config not in _FLOW_CONFIGS:
-            raise ValueError(f"flow_config must be one of {list(_FLOW_CONFIGS)}, got {flow_config!r}")
-        if satsuma_config not in _SATSUMA_CONFIGS:
-            raise ValueError(f"satsuma_config must be one of {list(_SATSUMA_CONFIGS)}, got {satsuma_config!r}")
+        # Coerce plain strings (e.g. from JSON) to enum members by name.
+        if not isinstance(ilp_method, ILPMethod):
+            ilp_method = ILPMethod[ilp_method]
+        if not isinstance(flow_config, FlowConfig):
+            flow_config = FlowConfig[flow_config]
+        if not isinstance(satsuma_config, SatsumaConfig):
+            satsuma_config = SatsumaConfig[satsuma_config]
 
         if debug_dir is not None:
             debug_dir = Path(debug_dir)
             debug_dir.mkdir(parents=True, exist_ok=True)
 
+        _CB_LEN = 8
         cb_time = callback_time_limit or [3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0]
         cb_gap  = callback_gap_limit  or [0.005, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.3]
-
-        scene       = self._to_scene(mesh)
-        geom_meshes = {k: v for k, v in scene.geometry.items() if isinstance(v, trimesh.Trimesh)}
+        if len(cb_time) != _CB_LEN:
+            raise QuadWildError(
+                f"callback_time_limit must have exactly {_CB_LEN} elements, got {len(cb_time)}"
+            )
+        if len(cb_gap) != _CB_LEN:
+            raise QuadWildError(
+                f"callback_gap_limit must have exactly {_CB_LEN} elements, got {len(cb_gap)}"
+            )
 
         pipeline_kwargs = dict(
             enable_preprocess=enable_preprocess,
@@ -416,144 +453,38 @@ class QuadWild:
             callback_gap_limit=cb_gap,
         )
 
-        log.info(f"[remesh] Input scene has {len(geom_meshes)} geometries")
-        if not merge_geometries and len(geom_meshes) > 1:
-            return self._quadrangulate_scene(
-                scene,
-                target_quad_count=target_quad_count,
-                debug_dir=debug_dir,
-                **pipeline_kwargs,
-            )
+        # Multi-geometry scene path (only for output_format="scene")
+        if output_format == "scene":
+            scene       = self._to_scene(mesh)
+            geom_meshes = {k: v for k, v in scene.geometry.items() if isinstance(v, trimesh.Trimesh)}
+            log.info(f"[remesh] Input scene has {len(geom_meshes)} geometries")
+            if not merge_geometries and len(geom_meshes) > 1:
+                return self._quadrangulate_scene(
+                    scene,
+                    target_quad_count=target_quad_count,
+                    debug_dir=debug_dir,
+                    **pipeline_kwargs,
+                )
+            tri_mesh = self._to_mesh(scene)
+        else:
+            tri_mesh = self._to_mesh(mesh)
 
-        tri_mesh = self._to_mesh(scene)
-        result = self._quadrangulate_mesh(
+        verts, faces = self._quadrangulate_mesh(
             tri_mesh,
             target_quad_count=target_quad_count,
             debug_dir=debug_dir,
-            output_format="trimesh",
             **pipeline_kwargs,
         )
         if debug_dir is not None:
             log.info("[remesh]  intermediate files saved to %s", debug_dir)
-        return trimesh.Scene({"mesh": result})
 
-    def quadrangulate(
-        self,
-        mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
-        *,
-        # ── Stage-1 (remeshAndField) ────────────────────────────────
-        enable_preprocess: bool = True,
-        enable_sharp: bool = True,
-        sharp_angle: float = 35.0,
-        # ── Stage-3 (quadPatches) ───────────────────────────────────
-        enable_smoothing: bool = True,
-        scale_factor: float = 1.0,
-        target_quad_count: Optional[int] = None,
-        fixed_chart_clusters: int = 0,
-        # ILP objective
-        alpha: float = 0.005,
-        ilp_method: str = "LEASTSQUARES",
-        time_limit: int = 200,
-        gap_limit: float = 0.0,
-        minimum_gap: float = 0.4,
-        isometry: bool = True,
-        regularity_quads: bool = True,
-        regularity_non_quads: bool = True,
-        regularity_non_quads_weight: float = 0.9,
-        align_singularities: bool = True,
-        align_singularities_weight: float = 0.1,
-        repeat_losing_iterations: bool = True,
-        repeat_losing_quads: bool = False,
-        repeat_losing_non_quads: bool = False,
-        repeat_losing_align: bool = True,
-        hard_parity_constraint: bool = True,
-        # Solver config presets
-        flow_config: str = "SIMPLE",
-        satsuma_config: str = "LEMON",
-        # Callback schedule (8-element lists; defaults are used when None)
-        callback_time_limit: Optional[List[float]] = None,
-        callback_gap_limit: Optional[List[float]] = None,
-        # Diagnostics
-        debug_dir: Optional[Union[str, Path]] = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Run the full quad-remeshing pipeline and return raw vertex and face arrays.
+        if output_format == "arrays":
+            return verts, faces
 
-        Unlike :meth:`remesh`, this returns the raw output of the C++ solver —
-        vertices as a ``(N, 3)`` float64 array and faces as an ``(M, K)`` int64
-        array of polygon indices (quads have ``K=4``; any triangular faces from
-        the solver have ``K=3``).  No trimesh wrapping, triangulation, or scene
-        graph structure is applied.
-
-        Multi-geometry scenes are merged into a single mesh before processing.
-
-        Parameters
-        ----------
-        mesh:
-            Same as :meth:`remesh`.
-
-        Returns
-        -------
-        vertices : np.ndarray, shape (N, 3), dtype float64
-        faces    : np.ndarray, shape (M, K), dtype int64
-            Polygon faces — typically all quads (``K=4``).
-
-        Raises
-        ------
-        QuadWildError
-            If input validation fails or any pipeline stage fails.
-        ValueError
-            If an unsupported enum-style string is passed.
-        """
-        if ilp_method not in _ILP_METHODS:
-            raise ValueError(f"ilp_method must be one of {list(_ILP_METHODS)}, got {ilp_method!r}")
-        if flow_config not in _FLOW_CONFIGS:
-            raise ValueError(f"flow_config must be one of {list(_FLOW_CONFIGS)}, got {flow_config!r}")
-        if satsuma_config not in _SATSUMA_CONFIGS:
-            raise ValueError(f"satsuma_config must be one of {list(_SATSUMA_CONFIGS)}, got {satsuma_config!r}")
-
-        if debug_dir is not None:
-            debug_dir = Path(debug_dir)
-            debug_dir.mkdir(parents=True, exist_ok=True)
-
-        cb_time = callback_time_limit or [3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0]
-        cb_gap  = callback_gap_limit  or [0.005, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.3]
-
-        pipeline_kwargs = dict(
-            enable_preprocess=enable_preprocess,
-            enable_sharp=enable_sharp,
-            sharp_angle=sharp_angle,
-            enable_smoothing=enable_smoothing,
-            scale_factor=scale_factor,
-            fixed_chart_clusters=fixed_chart_clusters,
-            alpha=alpha,
-            ilp_method=ilp_method,
-            time_limit=time_limit,
-            gap_limit=gap_limit,
-            minimum_gap=minimum_gap,
-            isometry=isometry,
-            regularity_quads=regularity_quads,
-            regularity_non_quads=regularity_non_quads,
-            regularity_non_quads_weight=regularity_non_quads_weight,
-            align_singularities=align_singularities,
-            align_singularities_weight=align_singularities_weight,
-            repeat_losing_iterations=repeat_losing_iterations,
-            repeat_losing_quads=repeat_losing_quads,
-            repeat_losing_non_quads=repeat_losing_non_quads,
-            repeat_losing_align=repeat_losing_align,
-            hard_parity_constraint=hard_parity_constraint,
-            flow_config=flow_config,
-            satsuma_config=satsuma_config,
-            callback_time_limit=cb_time,
-            callback_gap_limit=cb_gap,
-        )
-
-        tri_mesh = self._to_mesh(self._to_scene(mesh))
-        return self._quadrangulate_mesh(
-            tri_mesh,
-            target_quad_count=target_quad_count,
-            debug_dir=debug_dir,
-            **pipeline_kwargs,
-        )
+        result_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        if output_format == "scene":
+            return trimesh.Scene({"mesh": result_mesh})
+        return result_mesh
 
     # ------------------------------------------------------------------
     # Private — pipeline helpers
@@ -574,26 +505,26 @@ class QuadWild:
         """
         geom_meshes = {k: v for k, v in scene.geometry.items() if isinstance(v, trimesh.Trimesh)}
 
-        _MIN_QUADS_PER_PART = 50
-
         total_verts = sum(len(g.vertices) for g in geom_meshes.values())
         total_faces = sum(len(g.faces) for g in geom_meshes.values())
 
         log.info(f"[_quadrangulate_scene]  geometries={len(geom_meshes)}  total_vertices={total_verts}  total_faces={total_faces}")
 
+        # Skip geometries with zero faces — they can't be quad-remeshed.
+        geom_meshes = {k: v for k, v in geom_meshes.items() if len(v.faces) > 0}
+        if not geom_meshes:
+            log.warning("[_quadrangulate_scene]  all geometries have zero faces — returning empty scene")
+            return scene.copy()
+
         if target_quad_count is not None and target_quad_count > 0:
-            if total_faces > 0:
-                per_geom_target: dict = {
-                    name: max(_MIN_QUADS_PER_PART, round(target_quad_count * len(geom.faces) / total_faces))
-                    for name, geom in geom_meshes.items()
-                }
-            else:
-                equal_share = max(_MIN_QUADS_PER_PART, target_quad_count // len(geom_meshes))
-                per_geom_target = {name: equal_share for name in geom_meshes}
+            per_geom_target: dict[str, Optional[int]] = {
+                name: max(_MIN_QUADS_PER_PART, round(target_quad_count * len(geom.faces) / total_faces))
+                for name, geom in geom_meshes.items()
+            }
         else:
             per_geom_target = {name: None for name in geom_meshes}
 
-        log.info(f"[process_scene] target_quad_count={target_quad_count} → per-geometry targets: {per_geom_target}")
+        log.info(f"[_quadrangulate_scene] target_quad_count={target_quad_count} → per-geometry targets: {per_geom_target}")
 
         def _remesh_process(name: str, geom: "trimesh.Trimesh") -> tuple:
             nv, nf = len(geom.vertices), len(geom.faces)
@@ -605,13 +536,13 @@ class QuadWild:
             geom_debug = (debug_dir / name) if debug_dir else None
             if geom_debug:
                 geom_debug.mkdir(parents=True, exist_ok=True)
-            result = self._quadrangulate_mesh(
+            v, f = self._quadrangulate_mesh(
                 geom.copy(),
                 target_quad_count=per_geom_target[name],
                 debug_dir=geom_debug,
-                output_format="trimesh",
                 **pipeline_kwargs,
             )
+            result = trimesh.Trimesh(vertices=v, faces=f, process=False)
             log.info(f"[_remesh_process]  done  name={name}")
             if geom_debug:
                 log.info(f"[_remesh_process]  name={name} files saved to {geom_debug}")
@@ -629,7 +560,6 @@ class QuadWild:
         *,
         target_quad_count: Optional[int],
         debug_dir: Optional[Path],
-        output_format: Literal["trimesh", "arrays"] = "arrays",
         enable_preprocess: bool,
         enable_sharp: bool,
         sharp_angle: float,
@@ -637,7 +567,7 @@ class QuadWild:
         scale_factor: float,
         fixed_chart_clusters: int,
         alpha: float,
-        ilp_method: str,
+        ilp_method: ILPMethod,
         time_limit: int,
         gap_limit: float,
         minimum_gap: float,
@@ -652,17 +582,22 @@ class QuadWild:
         repeat_losing_non_quads: bool,
         repeat_losing_align: bool,
         hard_parity_constraint: bool,
-        flow_config: str,
-        satsuma_config: str,
+        flow_config: FlowConfig,
+        satsuma_config: SatsumaConfig,
         callback_time_limit: List[float],
         callback_gap_limit: List[float],
-    ) -> Union["trimesh.Trimesh", tuple[np.ndarray, np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Run the full three-stage C++ pipeline on a single :class:`trimesh.Trimesh`.
 
-        Returns ``(vertices, faces)`` numpy arrays when *output_format* is ``"arrays"``
-        (the default), or a :class:`trimesh.Trimesh` when *output_format* is
-        ``"trimesh"``.  Quad faces remain as 4-element rows in the arrays output.
+        Returns ``(vertices, faces)`` numpy arrays.  Quad faces remain as
+        4-element rows.
         """
+        # Defensive copy so the caller's mesh is never mutated.
+        mesh = mesh.copy()
+        if len(mesh.faces) == 0:
+            raise QuadWildError("Input mesh has no faces")
+        if mesh.faces.shape[1] != 3:
+            raise QuadWildError("Input mesh must be strictly triangulated")
         # ── Nested helpers ────────────────────────────────────────────────────
         @contextlib.contextmanager
         def _suppress_c_output():
@@ -696,18 +631,32 @@ class QuadWild:
                 return 1.0
             return max(0.01, min(10.0, math.sqrt(n_faces / (2.0 * tqc))))
 
+        def _count_obj_elements(obj_file):
+            """Count vertices and faces in an OBJ file by scanning line prefixes."""
+            nv = nf = 0
+            with open(obj_file) as fh:
+                for ln in fh:
+                    if ln.startswith("v "):
+                        nv += 1
+                    elif ln.startswith("f "):
+                        nf += 1
+            return nv, nf
+
         def _preprocess(m):
+            """Run built-in decimation, triangulation, and geometry repair."""
             dv = 6
-            kw = dict(merge_tex=False, merge_norm=False, digits_vertex=dv,
-                      digits_norm=max(1, dv - 1), digits_uv=max(1, dv - 1))
-            m.merge_vertices(**kw)
+            m.merge_vertices(
+                merge_tex=False, 
+                merge_norm=False, 
+                digits_vertex=dv,
+                digits_norm=max(1, dv - 1), 
+                digits_uv=max(1, dv - 1)
+            )
             m.update_faces(m.nondegenerate_faces())
             m.update_faces(m.unique_faces())
             m.remove_unreferenced_vertices()
-            m._cache.clear()
             
             # smooth normals
-            m.merge_vertices(**kw)
             m.vertex_normals = trimesh.geometry.weighted_vertex_normals(
                 vertex_count=len(m.vertices),
                 faces=m.faces,
@@ -720,6 +669,7 @@ class QuadWild:
             return m
 
         def _call_stage1(obj_path, sharp_path, field_path):
+            """Call remeshAndField2 with the given parameters and file paths."""
             params = _Parameters(
                 remesh=enable_preprocess,
                 sharpAngle=sharp_angle if enable_sharp else -1.0,
@@ -740,6 +690,7 @@ class QuadWild:
                 raise QuadWildError("remeshAndField2 failed") from exc
 
         def _call_stage2(remeshed_base):
+            """Call trace2 with the given remeshed base path."""
             try:
                 with _c_ctx():
                     ok = self._qw.trace2(remeshed_base.encode())
@@ -752,6 +703,7 @@ class QuadWild:
                 )
 
         def _call_stage3(traced_path, sf):
+            """Call quadPatches with the given parameters and file paths."""
             cb_time_arr = (c_float * len(callback_time_limit))(*callback_time_limit)
             cb_gap_arr  = (c_float * len(callback_gap_limit))(*callback_gap_limit)
             p = _QRParameters()
@@ -770,10 +722,22 @@ class QuadWild:
             p.resultSmoothingNRing                       = 3.0
             p.resultSmoothingLaplacianIterations         = 2
             p.resultSmoothingLaplacianNRing              = 3.0
-            p.flow_config_filename    = str(self._config_dir / _FLOW_CONFIGS[flow_config]).encode()
-            p.satsuma_config_filename = str(self._config_dir / _SATSUMA_CONFIGS[satsuma_config]).encode()
+
+            flow_cfg_path = self._config_dir / flow_config.value
+            satsuma_cfg_path = self._config_dir / satsuma_config.value
+
+            if not flow_cfg_path.is_file():
+                raise QuadWildError(f"Flow config file not found: {flow_cfg_path}")
+            if not satsuma_cfg_path.is_file():
+                raise QuadWildError(f"Satsuma config file not found: {satsuma_cfg_path}")
+
+            # Keep strong references so the bytes survive until the C call returns.
+            flow_cfg_bytes    = str(flow_cfg_path).encode()
+            satsuma_cfg_bytes = str(satsuma_cfg_path).encode()
+            p.flow_config_filename    = flow_cfg_bytes
+            p.satsuma_config_filename = satsuma_cfg_bytes
             p.alpha                             = alpha
-            p.ilpMethod                         = _ILP_METHODS[ilp_method]
+            p.ilpMethod                         = ilp_method.value
             p.timeLimit                         = float(time_limit)
             p.gapLimit                          = gap_limit
             p.minimumGap                        = minimum_gap
@@ -804,7 +768,8 @@ class QuadWild:
 
         # ── Pipeline ──────────────────────────────────────────────────────────
         pre_merge_boundary = _get_boundary(mesh) if enable_sharp else set()
-        mesh = _preprocess(mesh)
+        if enable_preprocess:
+            mesh = _preprocess(mesh)
 
         log.info(
             f"[stage 0 / input]  "
@@ -843,9 +808,9 @@ class QuadWild:
             current_scale_factor, ilp_method, alpha, time_limit, flow_config, satsuma_config,
         )
 
-        tmpdir = tempfile.mkdtemp(prefix="quadwild_")
+        tmpdir = Path(tempfile.mkdtemp(prefix="quadwild_"))
         try:
-            base       = path.join(tmpdir, "mesh")
+            base       = str(tmpdir / "mesh")
             obj_path   = base + ".obj"
             sharp_path = base + "_rem.sharp"
             field_path = base + "_rem.rosy"
@@ -877,11 +842,12 @@ class QuadWild:
             log.info("[stages 1–3]  running C++ pipeline …")
             _call_stage1(obj_path, sharp_path, field_path)
 
-            remeshed_path_stage1 = remeshed_base + ".obj"
-            if target_quad_count is not None and target_quad_count > 0 and path.isfile(remeshed_path_stage1):
-                with open(remeshed_path_stage1) as _rf:
-                    n_remeshed_faces = sum(1 for ln in _rf if ln.startswith("f "))
-                if n_remeshed_faces > 0:
+            n_remeshed_verts = 0
+            n_remeshed_faces = 0
+            remeshed_obj = Path(remeshed_base + ".obj")
+            if remeshed_obj.is_file():
+                n_remeshed_verts, n_remeshed_faces = _count_obj_elements(remeshed_obj)
+                if target_quad_count is not None and target_quad_count > 0 and n_remeshed_faces > 0:
                     refined_sf = _estimate_sf(n_remeshed_faces, target_quad_count)
                     log.info(
                         "[stage 1]  remeshed faces=%d → refined scale_factor=%.4f "
@@ -891,26 +857,28 @@ class QuadWild:
                     current_scale_factor = refined_sf
 
             _call_stage2(remeshed_base)
-            _call_stage3(traced_path, current_scale_factor)
+            if (stage3_rc := _call_stage3(traced_path, current_scale_factor)) != 0:
+                raise QuadWildError(
+                    f"quadPatches returned non-zero exit code: {stage3_rc}"
+                )
             log.info("[stages 1–3 / done]")
 
-            remeshed_path = remeshed_base + ".obj"
-            if path.isfile(remeshed_path):
-                rem = self._import_obj(remeshed_path, output_format="trimesh")
-                log.info("[stage 1]  remeshed mesh: vertices=%d  faces=%d", len(rem.vertices), len(rem.faces))
+            if remeshed_obj.is_file():
+                log.info("[stage 1]  remeshed mesh: vertices=%d  faces=%d", n_remeshed_verts, n_remeshed_faces)
                 if debug_dir:
-                    shutil.copy2(remeshed_path, debug_dir / "02_remeshed.obj")
-            if path.isfile(traced_path):
-                tr = self._import_obj(traced_path, output_format="trimesh")
-                log.info("[stage 2]  traced mesh:   vertices=%d  faces=%d", len(tr.vertices), len(tr.faces))
+                    shutil.copy2(remeshed_obj, debug_dir / "02_remeshed.obj")
+            traced_obj = Path(traced_path)
+            if traced_obj.is_file():
+                tv, tf = _count_obj_elements(traced_obj)
+                log.info("[stage 2]  traced mesh:   vertices=%d  faces=%d", tv, tf)
                 if debug_dir:
-                    shutil.copy2(traced_path, debug_dir / "03_traced.obj")
-            if path.isfile(out_path) and debug_dir:
+                    shutil.copy2(traced_obj, debug_dir / "03_traced.obj")
+            if Path(out_path).is_file() and debug_dir:
                 shutil.copy2(out_path, debug_dir / "04_quadrangulation.obj")
-            if path.isfile(out_smooth) and debug_dir:
+            if Path(out_smooth).is_file() and debug_dir:
                 shutil.copy2(out_smooth, debug_dir / "05_quadrangulation_smooth.obj")
 
-            result_path = out_smooth if (enable_smoothing and path.isfile(out_smooth)) else out_path
+            result_path = out_smooth if (enable_smoothing and Path(out_smooth).is_file()) else out_path
 
             n_quads = n_tris_raw = 0
             with open(result_path) as _f:
@@ -926,7 +894,7 @@ class QuadWild:
             log.info(
                 "[stage 3 / done]  smoothed=%s  "
                 "quads=%d  tris=%d  (total C++ faces=%d)  vertices=%d",
-                enable_smoothing and path.isfile(out_smooth),
+                enable_smoothing and Path(out_smooth).is_file(),
                 n_quads, n_tris_raw, n_quads + n_tris_raw,
                 len(verts_out),
             )
@@ -934,8 +902,6 @@ class QuadWild:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-        if output_format == "trimesh":
-            return trimesh.Trimesh(vertices=verts_out, faces=faces_out, process=False)
         return verts_out, faces_out
 
     # ------------------------------------------------------------------
@@ -956,32 +922,37 @@ class QuadWild:
             raise TypeError(f"Input must be a file path, Trimesh, or Scene; got {type(mesh)}")
 
     def _to_mesh(
-        self, 
-        scene: "trimesh.Scene"
+        self,
+        mesh: Union[str, Path, "trimesh.Trimesh", "trimesh.Scene"],
     ) -> "trimesh.Trimesh":
-        """Concatenate every Trimesh geometry in the scene into one mesh."""
-        if isinstance(scene, trimesh.Trimesh):
-            return scene
-        elif isinstance(scene, (Path, str)):
-            loaded = trimesh.load(scene, force='mesh', process=False)
+        """Flatten any supported input type to a single :class:`trimesh.Trimesh`.
+
+        Accepts a file path (``str`` / ``Path``), a :class:`trimesh.Trimesh`,
+        or a :class:`trimesh.Scene`.  For scenes and scene files, all Trimesh
+        geometries are concatenated with their scene-graph transforms baked in.
+        """
+        if isinstance(mesh, trimesh.Trimesh):
+            return mesh
+        elif isinstance(mesh, (Path, str)):
+            loaded = trimesh.load(mesh, force='mesh', process=False)
             if isinstance(loaded, trimesh.Trimesh):
                 return loaded
             elif isinstance(loaded, trimesh.Scene):
                 if len(loaded.geometry) == 0:
-                    raise ValueError("No geometry found in the scene.")            
+                    raise ValueError("No geometry found in the scene.")
                 # Use to_geometry() to correctly bake in transforms from the scene graph
                 return loaded.to_geometry() if hasattr(loaded, 'to_geometry') else loaded.dump(concatenate=True)
             else:
                 raise TypeError(f"Loaded object is neither a Trimesh nor a Scene: {type(loaded)}")
-        elif isinstance(scene, trimesh.Scene):
-            if len(scene.geometry) == 0:
-                raise ValueError("No geometry found in the scene.")        
+        elif isinstance(mesh, trimesh.Scene):
+            if len(mesh.geometry) == 0:
+                raise ValueError("No geometry found in the scene.")
             # Use to_geometry() to correctly bake in transforms from the scene graph
-            return scene.to_geometry() if hasattr(scene, 'to_geometry') else scene.dump(concatenate=True)
-        elif scene is None:
+            return mesh.to_geometry() if hasattr(mesh, 'to_geometry') else mesh.dump(concatenate=True)
+        elif mesh is None:
             raise ValueError("Input cannot be None")
         else:
-            raise TypeError(f"Input must be a Trimesh, Scene, or file path; got {type(scene)}")
+            raise TypeError(f"Input must be a Trimesh, Scene, or file path; got {type(mesh)}")
 
     # ------------------------------------------------------------------
     # Private — IO helpers
@@ -989,30 +960,45 @@ class QuadWild:
     def _import_obj(
         self,
         obj_path: str,
-        output_format: Literal["trimesh", "arrays"] = "arrays",
+        output_format: Literal["mesh", "arrays"] = "arrays",
     ) -> Union["trimesh.Trimesh", tuple[np.ndarray, np.ndarray]]:
         """Parse an OBJ file and return either raw arrays or a :class:`trimesh.Trimesh`.
 
         Faces are returned as-is (quads remain as 4-element rows when
-        *output_format* is ``"arrays"``).  Pass ``output_format="trimesh"`` to get a
+        *output_format* is ``"arrays"``).  Pass ``output_format="mesh"`` to get a
         :class:`trimesh.Trimesh` instead (trimesh will triangulate quads).
         """
-        if not path.isfile(obj_path):
+        if not Path(obj_path).is_file():
             raise QuadWildError(f"Expected output file not found: {obj_path}")
-        verts, faces = [], []
-        with open(obj_path) as f:
-            for line in f:
-                tokens = line.split()
-                if not tokens:
-                    continue
-                if tokens[0] == "v":
-                    verts.append([float(x) for x in tokens[1:4]])
-                elif tokens[0] == "f":
-                    faces.append([int(t.split("/")[0]) - 1 for t in tokens[1:]])
+        with open(obj_path) as fh:
+            tokens_by_line = [t for line in fh if (t := line.split())]
+        verts = [[float(x) for x in t[1:4]] for t in tokens_by_line if t[0] == "v"]
+        faces = [[int(tok.split("/")[0]) - 1 for tok in t[1:]] for t in tokens_by_line if t[0] == "f"]
         v = np.array(verts, dtype=np.float64)
-        f = np.array(faces, dtype=np.int64)
-        if output_format == "trimesh":
-            return trimesh.Trimesh(vertices=v, faces=f, process=False)
+
+        if output_format == "mesh":
+            # Triangulate quads (and n-gons) so trimesh gets a uniform Nx3 array.
+            tris = [
+                [face[0], face[i], face[i + 1]]
+                for face in faces
+                for i in range(1, len(face) - 1)
+            ]
+            return trimesh.Trimesh(
+                vertices=v,
+                faces=np.array(tris, dtype=np.int64),
+                process=False,
+            )
+
+        # "arrays" — preserve quads; pad shorter faces so the array is rectangular.
+        face_lengths = {len(face) for face in faces}
+        if len(face_lengths) <= 1:
+            f = np.array(faces, dtype=np.int64)
+        else:
+            max_len = max(face_lengths)
+            f = np.array(
+                [face + [face[-1]] * (max_len - len(face)) for face in faces],
+                dtype=np.int64,
+            )
         return v, f
 
     def _export_obj(
@@ -1077,12 +1063,17 @@ class QuadWild:
 
         Returns the number of sharp edges written.
         """
-        edge_in_face = lambda face, ev: next(
-            (i for i, (a, b) in enumerate(
+        if mesh.faces.shape[1] != 3:
+            raise QuadWildError("_export_sharp requires a triangulated mesh")
+
+        def edge_in_face(face, ev):
+            ev_set = frozenset(ev)
+            for i, (a, b) in enumerate(
                 ((face[0], face[1]), (face[1], face[2]), (face[0], face[2])),
-            ) if frozenset((a, b)) == frozenset(ev)),
-            -1,
-        )
+            ):
+                if frozenset((a, b)) == ev_set:
+                    return i
+            return -1
 
         def edge_convexity(fi0, fi1):
             n0, c0, c1 = mesh.face_normals[fi0], mesh.triangles_center[fi0], mesh.triangles_center[fi1]

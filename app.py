@@ -1,7 +1,7 @@
-"""server.py — Flask backend for the QuadWild HTML UI.
+"""app.py — Flask backend for the QuadWild HTML UI.
 
 Run with:
-    python server.py
+    python app.py
 """
 
 from __future__ import annotations
