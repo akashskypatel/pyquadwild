@@ -311,11 +311,7 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-sy
           </div>
           <div class="row"><label>Adaptive</label><input type="checkbox" id="tri_adaptive"></div>
           <div class="row"><label>Check Surf Distance</label><input type="checkbox" id="tri_check_surf_dist" checked></div>
-          <div style="display: flex; gap: 4px; margin-top: 4px; margin-bottom: 4px;">
-            <button class="btn btn-secondary" id="manifold-btn" disabled style="flex: 1;">Make Manifold</button>
-            <button class="btn btn-secondary" id="send-manifold-input-btn" disabled style="flex: 0 0 auto; width: 20px; padding: 0; min-width: unset;" title="Use result as input">↑</button>
-          </div>
-          <div style="display: flex; gap: 4px;">
+          <div style="display: flex; gap: 4px; margin-top: 8px;">
             <button class="btn btn-secondary" id="tri-remesh-btn" disabled style="flex: 1;">Remesh Triangles</button>
             <button class="btn btn-secondary" id="send-tri-input-btn" disabled style="flex: 0 0 auto; width: 20px; padding: 0; min-width: unset;" title="Use result as input">↑</button>
           </div>
@@ -606,7 +602,7 @@ function buildQuadWireframe(objText) {
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  const mat = new THREE.LineBasicMaterial({ color: 0xe94560, opacity: 0.85, transparent: true });
+  const mat = new THREE.LineBasicMaterial({ color: 0xf5a623, opacity: 0.75, transparent: true });
   return new THREE.LineSegments(geo, mat);
 }
 
@@ -655,14 +651,15 @@ outputMatSel.addEventListener('change', () => {
 let uploadedFile = null;
 let lastGlbBlob = null;
 let lastObjText = null;
+let lastRemeshedFormat = null;
 
 const fileInput     = document.getElementById('file-input');
 const uploadOverlay = document.getElementById('input-upload-overlay');
 const dropOverlay   = document.getElementById('drop-overlay');
 const inputInfoEl   = document.getElementById('input-info');
 const remeshBtn     = document.getElementById('remesh-btn');
-const manifoldBtn   = document.getElementById('manifold-btn');
-const sendManifoldInputBtn = document.getElementById('send-manifold-input-btn');
+
+
 const triRemeshBtn  = document.getElementById('tri-remesh-btn');
 const sendTriInputBtn = document.getElementById('send-tri-input-btn');
 const statFacesLabel = document.getElementById('stat-faces-label');
@@ -691,9 +688,8 @@ async function handleFile(file) {
   uploadedFile = file;
   uploadOverlay.classList.add('loaded'); // semi-hide, still hoverable
   remeshBtn.disabled = false;
-  manifoldBtn.disabled = false;
   triRemeshBtn.disabled = false;
-  sendManifoldInputBtn.disabled = true;
+  
   sendTriInputBtn.disabled = true;
   inputInfoEl.textContent = 'Loading…';
 
@@ -775,9 +771,9 @@ function getSettings() {
 remeshBtn.addEventListener('click', async () => {
   if (!uploadedFile) return;
   remeshBtn.disabled = true;
-  manifoldBtn.disabled = true;
+  
   triRemeshBtn.disabled = true;
-  sendManifoldInputBtn.disabled = true;
+  
   sendTriInputBtn.disabled = true;
   spinnerEl.classList.add('visible');
   statusEl.textContent = 'Remeshing…';
@@ -797,6 +793,7 @@ remeshBtn.addEventListener('click', async () => {
     const glbBytes = Uint8Array.from(atob(glbB64), c => c.charCodeAt(0));
     lastGlbBlob = new Blob([glbBytes], { type: 'model/gltf-binary' });
     lastObjText = atob(objB64);
+    lastRemeshedFormat = 'quads';
 
     // Dispose previous quad wireframe overlay
     if (outputViewer.quadWireframe) {
@@ -840,77 +837,13 @@ remeshBtn.addEventListener('click', async () => {
   } finally {
     spinnerEl.classList.remove('visible');
     remeshBtn.disabled = false;
-    manifoldBtn.disabled = false;
     triRemeshBtn.disabled = false;
-  }
-});
-
-/* ═══════════════════════════════════════════════════════════
-   Make Manifold
-   ═══════════════════════════════════════════════════════════ */
-manifoldBtn.addEventListener('click', async () => {
-  if (!uploadedFile) return;
-  manifoldBtn.disabled = true;
-  remeshBtn.disabled = true;
-  sendManifoldInputBtn.disabled = true;
-  spinnerEl.classList.add('visible');
-  statusEl.textContent = 'Making manifold…';
-  downloadGlbBtn.style.display = 'none';
-  downloadObjBtn.style.display = 'none';
-
-  const fd = new FormData();
-  fd.append('file', uploadedFile);
-
-  try {
-    const resp = await fetch('/make_manifold', { method: 'POST', body: fd });
-    if (!resp.ok) throw new Error(await resp.text());
-    const { glb: glbB64, obj: objB64, used_manifold3d } = await resp.json();
-
-    const glbBytes = Uint8Array.from(atob(glbB64), c => c.charCodeAt(0));
-    lastGlbBlob = new Blob([glbBytes], { type: 'model/gltf-binary' });
-    lastObjText = atob(objB64);
-
-    // Remove any quad wireframe from a previous remesh
-    if (outputViewer.quadWireframe) {
-      outputViewer.scene.remove(outputViewer.quadWireframe);
-      outputViewer.quadWireframe.geometry.dispose();
-      outputViewer.quadWireframe.material.dispose();
-      outputViewer.quadWireframe = null;
-    }
-
-    const info = await loadGlb(outputViewer, lastGlbBlob);
-    applyMaterial(outputViewer, outputMatSel.value, false);
-    applyPolygonOffset(outputViewer);
-    // Manifold output is triangulated — show plain wireframe if Wire is on
-    applyWireframe(outputViewer, outputWireCb.checked);
-
-    const triCount = lastObjText.split('\n').filter(l => l.trimStart().startsWith('f ')).length;
-    statFacesLabel.textContent = 'Triangles';
-    statGeoms.textContent = info.geoms.toLocaleString();
-    statVerts.textContent = info.verts.toLocaleString();
-    statFaces.textContent = triCount.toLocaleString();
-    outputStats.style.display = 'flex';
-    statusEl.textContent = used_manifold3d ? 'Manifold done.' : 'Repaired (trimesh fallback — manifold3d could not process this mesh).';
-    downloadGlbBtn.style.display = '';
-    downloadObjBtn.style.display = '';
-    sendManifoldInputBtn.disabled = false;
-
-    outputViewer.resize();
-  } catch (e) {
-    statusEl.textContent = 'Manifold error: ' + e.message;
-    outputStats.style.display = 'none';
-    statGeoms.textContent = statVerts.textContent = statFaces.textContent = '—';
-  } finally {
-    spinnerEl.classList.remove('visible');
-    manifoldBtn.disabled = false;
-    triRemeshBtn.disabled = false;
-    remeshBtn.disabled = false;
   }
 });
 
 triRemeshBtn.addEventListener('click', async () => {
   if (!uploadedFile) return;
-  manifoldBtn.disabled = true;
+  
   triRemeshBtn.disabled = true;
   remeshBtn.disabled = true;
   sendTriInputBtn.disabled = true;
@@ -940,6 +873,7 @@ triRemeshBtn.addEventListener('click', async () => {
     const glbBytes = Uint8Array.from(atob(glbB64), c => c.charCodeAt(0));
     lastGlbBlob = new Blob([glbBytes], { type: 'model/gltf-binary' });
     lastObjText = atob(objB64);
+    lastRemeshedFormat = 'tris';
 
     if (outputViewer.quadWireframe) {
       outputViewer.scene.remove(outputViewer.quadWireframe);
@@ -951,7 +885,13 @@ triRemeshBtn.addEventListener('click', async () => {
     const info = await loadGlb(outputViewer, lastGlbBlob);
     applyMaterial(outputViewer, outputMatSel.value, false);
     applyPolygonOffset(outputViewer);
-    applyWireframe(outputViewer, outputWireCb.checked);
+
+    // Build edge overlay from OBJ (same as quad remesh — solid + wireframe overlay)
+    const trLine = buildQuadWireframe(lastObjText);
+    trLine.position.set(-info.center.x, -info.center.y, -info.center.z);
+    trLine.visible = outputWireCb.checked;
+    outputViewer.scene.add(trLine);
+    outputViewer.quadWireframe = trLine;
 
     const triCount = lastObjText.split('\n').filter(l => l.trimStart().startsWith('f ')).length;
     statFacesLabel.textContent = 'Triangles';
@@ -971,24 +911,33 @@ triRemeshBtn.addEventListener('click', async () => {
     statGeoms.textContent = statVerts.textContent = statFaces.textContent = '—';
   } finally {
     spinnerEl.classList.remove('visible');
-    manifoldBtn.disabled = false;
     triRemeshBtn.disabled = false;
     remeshBtn.disabled = false;
   }
 });
 
 function sendResultToInput() {
-  if (!lastObjText) return;
+  if (lastRemeshedFormat === 'quads' && lastObjText) {
+    let stem = 'mesh';
+    if (uploadedFile && uploadedFile.name) {
+      stem = uploadedFile.name.replace(/\.[^.]+$/, '');
+    }
+    const newName = stem + '_processed.obj';
+    const file = new File([new Blob([lastObjText], { type: 'text/plain' })], newName, { type: 'text/plain' });
+    handleFile(file);
+    return;
+  }
+  if (!lastGlbBlob) return;
   let stem = 'mesh';
   if (uploadedFile && uploadedFile.name) {
     stem = uploadedFile.name.replace(/\.[^.]+$/, '');
   }
-  const newName = stem + '_processed.obj';
-  const file = new File([lastObjText], newName, { type: 'text/plain' });
+  const newName = stem + '_processed.glb';
+  const file = new File([lastGlbBlob], newName, { type: 'model/gltf-binary' });
   handleFile(file);
 }
 
-sendManifoldInputBtn.addEventListener('click', sendResultToInput);
+
 sendTriInputBtn.addEventListener('click', sendResultToInput);
 
 /* Download result */

@@ -10,5 +10,8 @@ scipy>=1.10.0
 # Graph algorithms (required by trimesh.repair.fill_holes)
 networkx>=3.0
 
-# Flask backend (for server.py HTML UI)
+# Flask backend
 flask>=3.0.0
+
+# Mesh repair and remeshing (preprocess + triangle remesh endpoint)
+pymeshlab>=2023.12
