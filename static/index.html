@@ -109,6 +109,10 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-sy
   padding:1px 4px;font-size:11px;outline:none;
 }
 .viewer-bar .spacer{flex:1}
+.view-toggle{display:flex;border:1px solid #0f3460;border-radius:4px;overflow:hidden;flex-shrink:0}
+.view-toggle button{background:#1a1a2e;color:#7a8ba6;border:none;padding:2px 10px;font-size:11px;font-weight:600;cursor:pointer;transition:background .15s,color .15s;line-height:1.8}
+.view-toggle button.active{background:#e94560;color:#fff}
+.view-toggle button:hover:not(.active){background:#0f3460;color:#e0e0e0}
 
 /* ── Right Panel ───────────────────────────────────────── */
 #right-panel{flex:1;display:flex;flex-direction:column;position:relative;overflow:hidden}
@@ -334,8 +338,12 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-sy
         <option value="normal">Normal</option>
       </select>
       <span class="spacer"></span>
-      <button class="btn btn-primary" id="download-glb-btn" style="width:auto;padding:3px 10px;font-size:11px;display:none">GLB</button>
-      <button class="btn btn-primary" id="download-obj-btn" style="width:auto;padding:3px 10px;font-size:11px;display:none;margin-left:4px;background:#0f3460;border:1px solid #e94560">OBJ</button>
+      <div class="view-toggle" id="view-mode-toggle" style="display:none">
+        <button id="view-glb-btn" class="active" title="GLB — sub-part hierarchy">GLB</button>
+        <button id="view-obj-btn" title="OBJ — quad topology">OBJ</button>
+      </div>
+      <button class="btn btn-primary" id="download-glb-btn" style="width:auto;padding:3px 10px;font-size:11px;display:none;margin-left:4px">↓ GLB</button>
+      <button class="btn btn-primary" id="download-obj-btn" style="width:auto;padding:3px 10px;font-size:11px;display:none;margin-left:4px;background:#0f3460;border:1px solid #e94560">↓ OBJ</button>
     </div>
     <div id="output-canvas-wrap">
       <canvas id="output-canvas"></canvas>
@@ -616,6 +624,107 @@ function applyPolygonOffset(v) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   Build solid mesh from OBJ text (OBJ view mode)
+   ═══════════════════════════════════════════════════════════ */
+function loadObj(viewer, objText) {
+  const lines = objText.split('\n');
+  const verts = [];
+  const triPositions = [];
+  for (const line of lines) {
+    const tok = line.trim().split(/\s+/);
+    if (tok[0] === 'v') {
+      verts.push(parseFloat(tok[1]), parseFloat(tok[2]), parseFloat(tok[3]));
+    } else if (tok[0] === 'f') {
+      const idx = tok.slice(1).map(t => parseInt(t.split('/')[0], 10) - 1);
+      for (let i = 1; i < idx.length - 1; i++) {
+        const ai=idx[0]*3, bi=idx[i]*3, ci=idx[i+1]*3;
+        triPositions.push(verts[ai],verts[ai+1],verts[ai+2], verts[bi],verts[bi+1],verts[bi+2], verts[ci],verts[ci+1],verts[ci+2]);
+      }
+    }
+  }
+  disposeModel(viewer);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(triPositions, 3));
+  geo.computeVertexNormals();
+  geo.computeBoundingBox();
+  geo.computeBoundingSphere();
+  const mat = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0.1 });
+  const mesh = new THREE.Mesh(geo, mat);
+  const model = new THREE.Group();
+  model.add(mesh);
+  viewer.scene.add(model);
+  viewer.currentModel = model;
+  viewer.originalMaterials.set(mesh, mat);
+  const center = new THREE.Vector3();
+  geo.boundingBox.getCenter(center);
+  model.position.sub(center);
+  const radius = geo.boundingSphere.radius || 1;
+  const dist = radius * 2.5;
+  viewer.camera.near = Math.max(0.01, radius / 100);
+  viewer.camera.far = radius * 200;
+  viewer.camera.position.set(dist * 0.7, dist * 0.5, dist * 0.7);
+  viewer.camera.updateProjectionMatrix();
+  viewer.controls.target.set(0, 0, 0);
+  viewer.controls.update();
+  return {
+    verts: verts.length / 3,
+    faces: lines.filter(l => l.trimStart().startsWith('f ')).length,
+    geoms: 1,
+    center: center.clone(),
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Switch output view mode (GLB ↔ OBJ) without re-remeshing
+   ═══════════════════════════════════════════════════════════ */
+async function switchViewMode(mode) {
+  if (!lastGlbBlob && !lastObjText) return;
+  viewMode = mode;
+  document.getElementById('view-glb-btn').classList.toggle('active', mode === 'glb');
+  document.getElementById('view-obj-btn').classList.toggle('active', mode === 'obj');
+  if (outputViewer.quadWireframe) {
+    outputViewer.scene.remove(outputViewer.quadWireframe);
+    outputViewer.quadWireframe.geometry.dispose();
+    outputViewer.quadWireframe.material.dispose();
+    outputViewer.quadWireframe = null;
+  }
+  const faceLabel = lastRemeshedFormat === 'tris' ? 'Triangles' : 'Quads';
+  statFacesLabel.textContent = faceLabel;
+  let info;
+  if (mode === 'glb' && lastGlbBlob) {
+    info = await loadGlb(outputViewer, lastGlbBlob);
+    applyMaterial(outputViewer, outputMatSel.value, false);
+    applyPolygonOffset(outputViewer);
+    if (lastObjText) {
+      const qwLine = buildQuadWireframe(lastObjText);
+      qwLine.position.set(-info.center.x, -info.center.y, -info.center.z);
+      qwLine.visible = outputWireCb.checked;
+      outputViewer.scene.add(qwLine);
+      outputViewer.quadWireframe = qwLine;
+    }
+    statGeoms.textContent = info.geoms.toLocaleString();
+    statVerts.textContent = info.verts.toLocaleString();
+    const fc = lastObjText ? lastObjText.split('\n').filter(l => l.trimStart().startsWith('f ')).length : info.faces;
+    statFaces.textContent = fc.toLocaleString();
+  } else if (mode === 'obj' && lastObjText) {
+    info = loadObj(outputViewer, lastObjText);
+    applyMaterial(outputViewer, outputMatSel.value, false);
+    applyPolygonOffset(outputViewer);
+    const qwLine = buildQuadWireframe(lastObjText);
+    qwLine.position.set(-info.center.x, -info.center.y, -info.center.z);
+    qwLine.visible = true;
+    outputWireCb.checked = true;
+    outputViewer.scene.add(qwLine);
+    outputViewer.quadWireframe = qwLine;
+    statGeoms.textContent = info.geoms.toLocaleString();
+    statVerts.textContent = info.verts.toLocaleString();
+    statFaces.textContent = info.faces.toLocaleString();
+  }
+  outputStats.style.display = 'flex';
+  outputViewer.resize();
+}
+
+/* ═══════════════════════════════════════════════════════════
    Init both viewers
    ═══════════════════════════════════════════════════════════ */
 const inputViewer  = createViewer('input-canvas', 'input-viewer-wrap');
@@ -645,6 +754,10 @@ outputMatSel.addEventListener('change', () => {
   applyPolygonOffset(outputViewer);
 });
 
+/* View mode toggle */
+document.getElementById('view-glb-btn').addEventListener('click', () => switchViewMode('glb'));
+document.getElementById('view-obj-btn').addEventListener('click', () => switchViewMode('obj'));
+
 /* ═══════════════════════════════════════════════════════════
    File upload — click + drag-and-drop (always re-uploadable)
    ═══════════════════════════════════════════════════════════ */
@@ -652,6 +765,7 @@ let uploadedFile = null;
 let lastGlbBlob = null;
 let lastObjText = null;
 let lastRemeshedFormat = null;
+let viewMode = 'glb';
 
 const fileInput     = document.getElementById('file-input');
 const uploadOverlay = document.getElementById('input-upload-overlay');
@@ -794,6 +908,10 @@ remeshBtn.addEventListener('click', async () => {
     lastGlbBlob = new Blob([glbBytes], { type: 'model/gltf-binary' });
     lastObjText = atob(objB64);
     lastRemeshedFormat = 'quads';
+    viewMode = 'glb';
+    document.getElementById('view-glb-btn').classList.add('active');
+    document.getElementById('view-obj-btn').classList.remove('active');
+    document.getElementById('view-mode-toggle').style.display = '';
 
     // Dispose previous quad wireframe overlay
     if (outputViewer.quadWireframe) {
@@ -874,6 +992,10 @@ triRemeshBtn.addEventListener('click', async () => {
     lastGlbBlob = new Blob([glbBytes], { type: 'model/gltf-binary' });
     lastObjText = atob(objB64);
     lastRemeshedFormat = 'tris';
+    viewMode = 'glb';
+    document.getElementById('view-glb-btn').classList.add('active');
+    document.getElementById('view-obj-btn').classList.remove('active');
+    document.getElementById('view-mode-toggle').style.display = '';
 
     if (outputViewer.quadWireframe) {
       outputViewer.scene.remove(outputViewer.quadWireframe);

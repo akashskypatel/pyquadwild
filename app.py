@@ -18,7 +18,7 @@ import numpy as np
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(levelname)s:%(name)s:%(message)s",
 )
 
@@ -82,7 +82,7 @@ def remesh_quads():
         scene = trimesh.load(tmp_path, force="scene")
         tqc = int(s.get("target_quad_count", 0))
 
-        verts, quads = _qw.remesh(
+        result_scene = _qw.remesh(
             scene,
             enable_preprocess=s.get("enable_preprocess", True),
             enable_sharp=s.get("enable_sharp", True),
@@ -114,35 +114,43 @@ def remesh_quads():
             merge_geometries=s.get("merge_geometries", False),
             flow_config=s.get("flow_config", "SIMPLE"),
             satsuma_config=s.get("satsuma_config", "LEMON"),
-            output_format="arrays",
+            output_format="scene",
         )
 
-        # --- Build quad OBJ (preserves quad topology) ---
+        # --- Collect all quad meshes from the returned scene (preserving names) ---
+        result_geoms = {
+            k: v for k, v in result_scene.geometry.items()
+            if isinstance(v, trimesh.Trimesh)
+        }
+
+        # --- Build quad OBJ (preserves quad topology, all geometries) ---
         obj_lines = ["# QuadWild quad-remesh result"]
-        for v in verts:
-            obj_lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
-        for face in quads:
-            face_list = list(face)
-            while len(face_list) > 3 and face_list[-1] == face_list[-2]:
-                face_list.pop()
-            obj_lines.append("f " + " ".join(str(int(idx) + 1) for idx in face_list))
+        vert_offset = 0
+        for geom in result_geoms.values():
+            for v in geom.vertices:
+                obj_lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+            for face in geom.faces:
+                face_list = [int(idx) + 1 + vert_offset for idx in face]
+                obj_lines.append("f " + " ".join(str(i) for i in face_list))
+            vert_offset += len(geom.vertices)
         obj_text = "\n".join(obj_lines) + "\n"
 
-        # --- Triangulate quads for GLB preview ---
-        tri_faces = []
-        for face in quads:
-            face_list = list(face)
-            while len(face_list) > 3 and face_list[-1] == face_list[-2]:
-                face_list.pop()
-            for i in range(1, len(face_list) - 1):
-                tri_faces.append([face_list[0], face_list[i], face_list[i + 1]])
-        tri_mesh = trimesh.Trimesh(
-            vertices=verts,
-            faces=np.array(tri_faces, dtype=np.int64),
-            process=False,
-        )
+        # --- Triangulate each geometry separately; export as multi-part GLB ---
+        glb_scene = trimesh.Scene()
+        for name, geom in result_geoms.items():
+            tri_faces = []
+            for face in geom.faces:
+                face_list = list(face)
+                for i in range(1, len(face_list) - 1):
+                    tri_faces.append([face_list[0], face_list[i], face_list[i + 1]])
+            tri_geom = trimesh.Trimesh(
+                vertices=geom.vertices,
+                faces=np.array(tri_faces, dtype=np.int64) if tri_faces else np.empty((0, 3), dtype=np.int64),
+                process=False,
+            )
+            glb_scene.add_geometry(tri_geom, geom_name=name)
         buf_glb = io.BytesIO()
-        trimesh.Scene({"mesh": tri_mesh}).export(buf_glb, file_type="glb")
+        glb_scene.export(buf_glb, file_type="glb")
 
         glb_b64 = base64.b64encode(buf_glb.getvalue()).decode("ascii")
         obj_b64 = base64.b64encode(obj_text.encode("utf-8")).decode("ascii")
