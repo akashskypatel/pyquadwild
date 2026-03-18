@@ -632,7 +632,7 @@ class QuadWild:
         def _count_obj_elements(obj_file):
             """Count vertices and faces in an OBJ file by scanning line prefixes."""
             nv = nf = 0
-            with open(obj_file) as fh:
+            with open(obj_file, encoding="utf-8") as fh:
                 for ln in fh:
                     if ln.startswith("v "):
                         nv += 1
@@ -641,30 +641,51 @@ class QuadWild:
             return nv, nf
 
         def _preprocess(m):
-            """Run built-in decimation, triangulation, and geometry repair."""
-            dv = 6
-            m.merge_vertices(
-                merge_tex=False, 
-                merge_norm=False, 
-                digits_vertex=dv,
-                digits_norm=max(1, dv - 1), 
-                digits_uv=max(1, dv - 1)
-            )
-            m.update_faces(m.nondegenerate_faces())
-            m.update_faces(m.unique_faces())
-            m.remove_unreferenced_vertices()
-            
-            # smooth normals
-            m.vertex_normals = trimesh.geometry.weighted_vertex_normals(
-                vertex_count=len(m.vertices),
-                faces=m.faces,
-                face_normals=m.face_normals,
-                face_angles=m.face_angles,
-            )
-            # fix normals and winding to ensure consistent orientation (important for remeshAndField2)
-            trimesh.repair.fix_normals(m)
-            trimesh.repair.fix_winding(m)
-            return m
+            """Repair and clean the mesh. Tries PyMeshLab first (non-manifold
+            repair, coherent face orientation), falls back to trimesh."""
+            try:
+                import pymeshlab
+            except ImportError:
+                log.warning("[preprocess] PyMeshLab unavailable, falling back to trimesh")
+                dv = 6
+                m.merge_vertices(merge_tex=False, merge_norm=False,
+                                  digits_vertex=dv, digits_norm=dv - 1, digits_uv=dv - 1)
+                m.update_faces(m.nondegenerate_faces())
+                m.update_faces(m.unique_faces())
+                m.remove_unreferenced_vertices()
+                m.vertex_normals = trimesh.geometry.weighted_vertex_normals(
+                    vertex_count=len(m.vertices), faces=m.faces,
+                    face_normals=m.face_normals, face_angles=m.face_angles,
+                )
+                trimesh.repair.fix_normals(m)
+                trimesh.repair.fix_winding(m)
+                return m
+
+            with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as _tf:
+                tmp = _tf.name
+            try:
+                m.export(tmp)
+                ms = pymeshlab.MeshSet()
+                ms.load_new_mesh(tmp)
+                for f in ("meshing_remove_duplicate_vertices",
+                          "meshing_remove_duplicate_faces",
+                          "meshing_remove_null_faces",
+                          "meshing_repair_non_manifold_edges",
+                          "meshing_repair_non_manifold_vertices",
+                          "meshing_re_orient_faces_coherently",
+                          "compute_normal_per_face",
+                          "compute_normal_per_vertex"):
+                    getattr(ms, f)()
+                cm = ms.current_mesh()
+                result = trimesh.Trimesh(
+                    vertices=cm.vertex_matrix(),
+                    faces=cm.face_matrix(),
+                    process=False,
+                )
+                log.info(f"[preprocess] done - verts={len(result.vertices)}  faces={len(result.faces)}  watertight={result.is_watertight}")
+                return result
+            finally:
+                Path(tmp).unlink(missing_ok=True)
 
         def _call_stage1(obj_path, sharp_path, field_path):
             """Call remeshAndField2 with the given parameters and file paths."""
@@ -879,7 +900,7 @@ class QuadWild:
             result_path = out_smooth if (enable_smoothing and Path(out_smooth).is_file()) else out_path
 
             n_quads = n_tris_raw = 0
-            with open(result_path) as _f:
+            with open(result_path, encoding="utf-8") as _f:
                 for _line in _f:
                     if _line.startswith("f "):
                         n_tokens = len(_line.split()) - 1
@@ -968,7 +989,7 @@ class QuadWild:
         """
         if not Path(obj_path).is_file():
             raise QuadWildError(f"Expected output file not found: {obj_path}")
-        with open(obj_path) as fh:
+        with open(obj_path, encoding="utf-8") as fh:
             tokens_by_line = [t for line in fh if (t := line.split())]
         verts = [[float(x) for x in t[1:4]] for t in tokens_by_line if t[0] == "v"]
         faces = [[int(tok.split("/")[0]) - 1 for tok in t[1:]] for t in tokens_by_line if t[0] == "f"]
@@ -1027,7 +1048,7 @@ class QuadWild:
             normals = np.cross(v1 - v0, v2 - v0)
             lens = np.linalg.norm(normals, axis=1, keepdims=True)
             normals = normals / np.maximum(lens, 1e-10)
-        with open(obj_path, "w") as f:
+        with open(obj_path, "w", encoding="utf-8") as f:
             f.write("# OBJ file\n")
             f.writelines(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n" for v in verts)
             f.writelines(f"vn {n[0]:.4f} {n[1]:.4f} {n[2]:.4f}\n" for n in normals)
@@ -1130,7 +1151,7 @@ class QuadWild:
             if (fi, ei) not in added
         )
 
-        with open(sharp_path, "w") as f:
+        with open(sharp_path, "w", encoding="utf-8") as f:
             f.write(f"{len(entries)}\n")
             f.writelines(f"{c},{fi},{ei}\n" for c, fi, ei in entries)
         return len(entries)
