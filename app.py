@@ -12,10 +12,13 @@ import logging
 import tempfile
 from pathlib import Path
 
-from flask import Flask, request, send_file, send_from_directory
+import base64
+
+import numpy as np
+from flask import Flask, jsonify, request, send_file, send_from_directory
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(levelname)s:%(name)s:%(message)s",
 )
 
@@ -23,7 +26,7 @@ import trimesh
 
 from pyquadwild import QuadWild, QuadWildError
 
-app = Flask(__name__, static_folder="static", static_url_path="")
+app = Flask(__name__, static_folder="static")
 
 _qw = QuadWild()
 
@@ -57,8 +60,8 @@ def convert_to_glb():
         Path(tmp_path).unlink(missing_ok=True)
 
 
-@app.route("/remesh", methods=["POST"])
-def remesh():
+@app.route("/remesh_quads", methods=["POST"])
+def remesh_quads():
     """Run the QuadWild pipeline and return the result as GLB."""
     f = request.files.get("file")
     if f is None:
@@ -77,13 +80,9 @@ def remesh():
 
     try:
         scene = trimesh.load(tmp_path, force="scene")
-        geom_count = sum(
-            1 for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)
-        )
-
         tqc = int(s.get("target_quad_count", 0))
 
-        result = _qw.remesh(
+        verts, quads = _qw.remesh(
             scene,
             enable_preprocess=s.get("enable_preprocess", True),
             enable_sharp=s.get("enable_sharp", True),
@@ -115,17 +114,262 @@ def remesh():
             merge_geometries=s.get("merge_geometries", False),
             flow_config=s.get("flow_config", "SIMPLE"),
             satsuma_config=s.get("satsuma_config", "LEMON"),
+            output_format="arrays",
         )
 
-        buf = io.BytesIO()
-        result.export(buf, file_type="glb")
-        buf.seek(0)
-        return send_file(buf, mimetype="model/gltf-binary", download_name="result.glb")
+        # --- Build quad OBJ (preserves quad topology) ---
+        obj_lines = ["# QuadWild quad-remesh result"]
+        for v in verts:
+            obj_lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+        for face in quads:
+            face_list = list(face)
+            while len(face_list) > 3 and face_list[-1] == face_list[-2]:
+                face_list.pop()
+            obj_lines.append("f " + " ".join(str(int(idx) + 1) for idx in face_list))
+        obj_text = "\n".join(obj_lines) + "\n"
+
+        # --- Triangulate quads for GLB preview ---
+        tri_faces = []
+        for face in quads:
+            face_list = list(face)
+            while len(face_list) > 3 and face_list[-1] == face_list[-2]:
+                face_list.pop()
+            for i in range(1, len(face_list) - 1):
+                tri_faces.append([face_list[0], face_list[i], face_list[i + 1]])
+        tri_mesh = trimesh.Trimesh(
+            vertices=verts,
+            faces=np.array(tri_faces, dtype=np.int64),
+            process=False,
+        )
+        buf_glb = io.BytesIO()
+        trimesh.Scene({"mesh": tri_mesh}).export(buf_glb, file_type="glb")
+
+        glb_b64 = base64.b64encode(buf_glb.getvalue()).decode("ascii")
+        obj_b64 = base64.b64encode(obj_text.encode("utf-8")).decode("ascii")
+        return jsonify({"glb": glb_b64, "obj": obj_b64})
 
     except QuadWildError as exc:
         return f"QuadWild error: {exc}", 500
     except Exception as exc:
         return f"Unexpected error: {exc}", 500
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+@app.route("/make_manifold", methods=["POST"])
+def make_manifold():
+    """Apply watertight manifold repair via manifold3d and return GLB + OBJ as base64 JSON."""
+    try:
+        import manifold3d
+    except ImportError:
+        return (
+            "manifold3d is not installed. Run: pip install manifold3d",
+            503,
+        )
+
+    f = request.files.get("file")
+    if f is None:
+        return "No file uploaded", 400
+
+    suffix = Path(f.filename).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        f.save(tmp)
+        tmp_path = tmp.name
+
+    try:
+        loaded = trimesh.load(tmp_path, force="scene", process=False)
+        repaired_geometries = {}
+        used_manifold3d_any = False
+
+        for geom_name, geom in loaded.geometry.items():
+            if not isinstance(geom, trimesh.Trimesh) or len(geom.faces) == 0:
+                repaired_geometries[geom_name] = geom
+                continue
+
+            # ── Step 1: trimesh repair ────────────────────────────────────────
+            g = trimesh.Trimesh(vertices=geom.vertices, faces=geom.faces, process=True)
+            g.merge_vertices(digits_vertex=5)
+            g.update_faces(g.nondegenerate_faces())
+            g.update_faces(g.unique_faces())
+            g.remove_unreferenced_vertices()
+            trimesh.repair.fix_winding(g)
+            trimesh.repair.fix_normals(g)
+            trimesh.repair.fill_holes(g)
+
+            logging.info(
+                "[make_manifold] %s after trimesh repair  vertices=%d  faces=%d  watertight=%s",
+                geom_name, len(g.vertices), len(g.faces), g.is_watertight,
+            )
+
+            # ── Step 2: attempt manifold3d ────────────────────────────────────
+            verts_in = np.array(g.vertices, dtype=np.float32)
+            faces_in = np.array(g.faces, dtype=np.uint32)
+
+            mesh_in = manifold3d.Mesh(vert_properties=verts_in, tri_verts=faces_in)
+            mfd = manifold3d.Manifold(mesh=mesh_in)
+
+            if not mfd.is_empty():
+                used_manifold3d_any = True
+                result_mesh_m3d = mfd.to_mesh()
+                out_verts = np.array(result_mesh_m3d.vert_properties[:, :3], dtype=np.float64)
+                out_faces = np.array(result_mesh_m3d.tri_verts, dtype=np.int32)
+                logging.info(
+                    "[make_manifold] %s manifold3d output  vertices=%d  faces=%d",
+                    geom_name, len(out_verts), len(out_faces),
+                )
+            else:
+                logging.warning(
+                    "[make_manifold] %s manifold3d returned empty — using trimesh-repaired mesh",
+                    geom_name,
+                )
+                out_verts = np.array(g.vertices, dtype=np.float64)
+                out_faces = np.array(g.faces, dtype=np.int32)
+
+            repaired_geometries[geom_name] = trimesh.Trimesh(
+                vertices=out_verts, faces=out_faces, process=False
+            )
+
+        # Reconstruct the scene preserving the original graph (transformations)
+        out_scene = trimesh.Scene()
+        for node_name in loaded.graph.nodes_geometry:
+            transform, geom_name = loaded.graph[node_name]
+            if geom_name in repaired_geometries:
+                out_scene.add_geometry(
+                    repaired_geometries[geom_name],
+                    geom_name=geom_name,
+                    node_name=node_name,
+                    transform=transform,
+                )
+
+        # Build GLB preview
+        buf_glb = io.BytesIO()
+        out_scene.export(buf_glb, file_type="glb")
+
+        # Build OBJ text
+        obj_export = out_scene.export(file_type="obj")
+        obj_text = obj_export.decode("utf-8") if isinstance(obj_export, bytes) else obj_export
+
+        glb_b64 = base64.b64encode(buf_glb.getvalue()).decode("ascii")
+        obj_b64 = base64.b64encode(obj_text.encode("utf-8")).decode("ascii")
+        return jsonify({"glb": glb_b64, "obj": obj_b64, "used_manifold3d": used_manifold3d_any})
+
+    except Exception as exc:
+        return f"Manifold error: {exc}", 500
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@app.route("/remesh_triangles", methods=["POST"])
+def remesh_triangles():
+    """Apply high-quality triangle remeshing using PyMeshLab and return GLB + OBJ."""
+    try:
+        import pymeshlab
+    except ImportError:
+        return "pymeshlab is not installed", 503
+
+    f = request.files.get("file")
+    if f is None:
+        return "No file uploaded", 400
+
+    raw_settings = request.form.get("settings", "{}")
+    try:
+        s = json.loads(raw_settings)
+    except json.JSONDecodeError:
+        s = {}
+
+    target_len = float(s.get("tri_target_len", 1.0))
+    iterations = int(s.get("tri_iterations", 3))
+    featuredeg = float(s.get("tri_feature_angle", 30.0))
+    adaptive = bool(s.get("tri_adaptive", False))
+    checksurfdist = bool(s.get("tri_check_surf_dist", True))
+    maxsurfdist_pct = float(s.get("tri_max_surf_dist", 1.0))
+
+    suffix = Path(f.filename).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        f.save(tmp)
+        tmp_path = tmp.name
+
+    try:
+        # Load mesh as a Scene
+        loaded = trimesh.load(tmp_path, force="scene", process=False)
+        remeshed_geometries = {}
+        
+        for geom_name, geom in loaded.geometry.items():
+            if not isinstance(geom, trimesh.Trimesh) or len(geom.faces) == 0:
+                remeshed_geometries[geom_name] = geom
+                continue
+
+            # Export current geometry to a temporary OBJ for PyMeshLab
+            with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as tmp_geom_in:
+                geom_in_path = tmp_geom_in.name
+            geom.export(geom_in_path)
+
+            try:
+                ms = pymeshlab.MeshSet()
+                ms.load_new_mesh(geom_in_path)
+
+                # Pre-cleanup: remove degenerate geometry
+                ms.apply_filter("meshing_remove_duplicate_vertices")
+                ms.apply_filter("meshing_remove_duplicate_faces")
+                ms.apply_filter("meshing_repair_non_manifold_edges")
+                ms.apply_filter("meshing_repair_non_manifold_vertices")
+
+                # Apply isotropic explicit remeshing
+                ms.apply_filter("meshing_isotropic_explicit_remeshing",
+                    targetlen=pymeshlab.PercentageValue(target_len),
+                    iterations=iterations,
+                    adaptive=adaptive,
+                    featuredeg=featuredeg,
+                    checksurfdist=checksurfdist,
+                    maxsurfdist=pymeshlab.PercentageValue(maxsurfdist_pct),
+                )
+                
+                with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as tmp_geom_out:
+                    geom_out_path = tmp_geom_out.name
+                
+                ms.save_current_mesh(geom_out_path)
+                
+                # Load the remeshed geometry back using trimesh
+                remeshed_geom = trimesh.load(geom_out_path, process=False)
+                if isinstance(remeshed_geom, trimesh.Scene):
+                    remeshed_geom = remeshed_geom.dump(concatenate=True)
+                
+                remeshed_geometries[geom_name] = remeshed_geom
+            finally:
+                Path(geom_in_path).unlink(missing_ok=True)
+                if 'geom_out_path' in locals():
+                    Path(geom_out_path).unlink(missing_ok=True)
+        
+        # Reconstruct the scene preserving the original graph (transformations)
+        out_scene = trimesh.Scene()
+        for node_name in loaded.graph.nodes_geometry:
+            transform, geom_name = loaded.graph[node_name]
+            if geom_name in remeshed_geometries:
+                out_scene.add_geometry(
+                    remeshed_geometries[geom_name], 
+                    geom_name=geom_name, 
+                    node_name=node_name, 
+                    transform=transform
+                )
+            
+        # Build GLB preview
+        buf_glb = io.BytesIO()
+        out_scene.export(buf_glb, file_type="glb")
+
+        # Build OBJ text natively from the scene
+        obj_export = out_scene.export(file_type="obj")
+        if isinstance(obj_export, bytes):
+            obj_text = obj_export.decode("utf-8")
+        else:
+            obj_text = obj_export
+
+        glb_b64 = base64.b64encode(buf_glb.getvalue()).decode("ascii")
+        obj_b64 = base64.b64encode(obj_text.encode("utf-8")).decode("ascii")
+        
+        return jsonify({"glb": glb_b64, "obj": obj_b64})
+
+    except Exception as exc:
+        logging.exception("PyMeshLab remesh error")
+        return f"PyMeshLab error: {exc}", 500
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
