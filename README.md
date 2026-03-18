@@ -30,6 +30,12 @@ Install them all at once:
 pip install -r requirements.txt
 ```
 
+Or install directly from GitHub:
+
+```bash
+pip install https://github.com/dickoah/pyquadwild
+```
+
 ---
 
 ## Building the C++ Libraries
