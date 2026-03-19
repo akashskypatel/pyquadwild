@@ -373,9 +373,9 @@ class QuadWild:
               boundary*, or *sculpt face-set boundary*.  This wrapper only
               uses dihedral angle and boundary.  The ``01_sharp.sharp`` file
               will therefore typically contain fewer entries than Blender's.
-            * **Mesh cleanup**: vertex merging, degenerate-face removal, and
-              normal fixes are currently commented out in ``_preprocess``.
-              Blender's bmesh always produces a clean, consistently-wound mesh.
+            * **Mesh cleanup**: uses PyMeshLab (if installed) or trimesh internally
+              for non-manifold repairs and normal orientation before sending the
+              mesh to C++. Blender's bmesh always produces a clean, consistently-wound mesh.
             * **Coordinate space**: QRemeshify strips the object's translation
               (applies only rotation + scale) so the mesh is centred near the
               origin.  This wrapper processes the mesh in whatever space it
@@ -661,12 +661,10 @@ class QuadWild:
                 trimesh.repair.fix_winding(m)
                 return m
 
-            with tempfile.NamedTemporaryFile(suffix=".obj", delete=False) as _tf:
-                tmp = _tf.name
             try:
-                m.export(tmp)
                 ms = pymeshlab.MeshSet()
-                ms.load_new_mesh(tmp)
+                pm_mesh = pymeshlab.Mesh(vertex_matrix=m.vertices, face_matrix=m.faces)
+                ms.add_mesh(pm_mesh)
                 for f in ("meshing_remove_duplicate_vertices",
                           "meshing_remove_duplicate_faces",
                           "meshing_remove_null_faces",
@@ -684,8 +682,9 @@ class QuadWild:
                 )
                 log.info(f"[preprocess] done - verts={len(result.vertices)}  faces={len(result.faces)}  watertight={result.is_watertight}")
                 return result
-            finally:
-                Path(tmp).unlink(missing_ok=True)
+            except Exception as e:
+                log.error(f"[preprocess] PyMeshLab failed: {e}. Returning original mesh.")
+                return m
 
         def _call_stage1(obj_path, sharp_path, field_path):
             """Call remeshAndField2 with the given parameters and file paths."""

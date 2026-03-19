@@ -1,6 +1,6 @@
 # pyquadwild
 
-A Python wrapper for the [QuadWild + Bi-MDF](https://github.com/cgg-bern/quadwild-bimdf) C++ quad-remeshing pipeline, with an optional [Gradio](https://www.gradio.app/) web demo.
+A Python wrapper for the [QuadWild + Bi-MDF](https://github.com/cgg-bern/quadwild-bimdf) C++ quad-remeshing pipeline, with an optional [Flask](https://flask.palletsprojects.com/) web demo.
 
 Given any triangulated 3-D mesh, it produces a clean quad-dominant mesh by running a three-stage C++ pipeline:
 
@@ -21,7 +21,8 @@ trimesh>=4.0.0
 numpy>=1.24.0
 scipy>=1.10.0
 networkx>=3.0
-gradio>=4.0.0   # only needed for the Gradio demo
+flask>=3.0.0      # only needed for the Flask demo
+pymeshlab>=2023.12
 ```
 
 Install them all at once:
@@ -48,7 +49,7 @@ The Python wrapper loads two platform-specific shared libraries at runtime:
 | macOS    | `liblib_quadwild.dylib`, `liblib_quadpatches.dylib` |
 | Windows  | `lib_quadwild.dll`, `lib_quadpatches.dll` |
 
-Clone and build [quadwild-bimdf](https://github.com/cgg-bern/quadwild-bimdf), then copy the resulting shared libraries into the `libs/` directory of this repository.
+Clone and build [QRemeshify](https://github.com/ksami/QRemeshify), then copy the resulting shared libraries into the `libs/` directory of this repository.
 
 ---
 
@@ -58,7 +59,7 @@ Clone and build [quadwild-bimdf](https://github.com/cgg-bern/quadwild-bimdf), th
 
 ```python
 import trimesh
-from src.quadwild import QuadWild
+from pyquadwild import QuadWild
 
 qw = QuadWild()  # loads libs/ and config/ from the repo root by default
 
@@ -80,7 +81,7 @@ result.export("output_quad.glb")
 To get raw vertex and face arrays instead of a scene:
 
 ```python
-vertices, faces = qw.quadrangulate(scene)
+vertices, faces = qw.remesh(scene, output_format="arrays")
 ```
 
 Custom library and config paths:
@@ -92,9 +93,9 @@ qw = QuadWild(
 )
 ```
 
-Both `remesh()` and `quadrangulate()` accept a file path (`str` / `Path`), a `trimesh.Trimesh`, or a `trimesh.Scene`. Scenes with multiple geometries are processed per-geometry by default; pass `merge_geometries=True` to merge them into a single mesh first.
+`remesh()` accepts a file path (`str` / `Path`), a `trimesh.Trimesh`, or a `trimesh.Scene`. Scenes with multiple geometries are processed per-geometry by default; pass `merge_geometries=True` to merge them into a single mesh first.
 
-### Gradio Web Demo
+### Flask Web Demo
 
 ```bash
 python app.py
@@ -159,7 +160,7 @@ Opens a local web UI where you can upload a mesh, adjust all parameters interact
 pyquadwild/
 ├── pyproject.toml
 ├── MANIFEST.in
-├── app.py              # Gradio web demo
+├── app.py              # Flask web demo
 ├── requirements.txt
 └── pyquadwild/
     ├── __init__.py
