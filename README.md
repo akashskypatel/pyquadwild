@@ -34,7 +34,7 @@ pip install -r requirements.txt
 Or install directly from GitHub:
 
 ```bash
-pip install https://github.com/dickoah/pyquadwild
+pip install git+https://github.com/dickoah/pyquadwild
 ```
 
 ---
