@@ -72,6 +72,7 @@ result = qw.remesh(
     enable_sharp=True,
     sharp_angle=35.0,
     scale_factor=1.0,
+    # field_path="my_mesh.rosy",  # optional precomputed QuadWild-compatible orientation field
     # target_quad_count=5000,  # override scale_factor with an approximate quad target
 )
 
@@ -82,6 +83,16 @@ To get raw vertex and face arrays instead of a scene:
 
 ```python
 vertices, faces = qw.remesh(scene, output_format="arrays")
+```
+
+To drive QuadWild from a precomputed `.rosy` field:
+
+```python
+vertices, faces = qw.remesh(
+    scene,
+    field_path="my_mesh.rosy",
+    output_format="arrays",
+)
 ```
 
 Custom library and config paths:
@@ -114,6 +125,7 @@ Opens a local web UI where you can upload a mesh, adjust all parameters interact
 | `enable_preprocess` | `bool` | `True` | Run built-in decimation, triangulation, and repair before field computation. |
 | `enable_sharp` | `bool` | `True` | Detect and mark sharp feature edges to steer the cross-field. |
 | `sharp_angle` | `float` | `35.0` | Dihedral-angle threshold in degrees for sharp-edge detection. |
+| `field_path` | `str \| Path \| None` | `None` | Optional path to a precomputed QuadWild-compatible `.rosy` field. When set, stage 1 reuses that field instead of computing one internally. |
 | `enable_smoothing` | `bool` | `True` | Apply Laplacian smoothing after quadrangulation. |
 | `scale_factor` | `float` | `1.0` | Controls output quad density. `> 1` → coarser; `< 1` → finer. Ignored when `target_quad_count` is set. |
 | `target_quad_count` | `int \| None` | `None` | Approximate target number of output quads. Overrides `scale_factor` when set. |

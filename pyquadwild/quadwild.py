@@ -243,6 +243,7 @@ class QuadWild:
         enable_preprocess: bool = True,
         enable_sharp: bool = True,
         sharp_angle: float = 35.0,
+        field_path: Optional[Union[str, Path]] = None,
         # ── Stage-3 (quadPatches) ───────────────────────────────────
         enable_smoothing: bool = True,
         scale_factor: float = 1.0,
@@ -307,6 +308,11 @@ class QuadWild:
         sharp_angle:
             Dihedral-angle threshold in **degrees**.  Edges above this value
             are marked as sharp features.  Default is ``35.0``.
+        field_path:
+            Optional path to a precomputed QuadWild-compatible ``.rosy`` field.
+            When provided, stage 1 reuses this orientation field instead of
+            computing a new one internally. The file is copied into the
+            temporary pipeline workspace before ``remeshAndField2`` runs.
         enable_smoothing:
             Apply post-quadrangulation Laplacian smoothing (stage 3).
         scale_factor:
@@ -352,11 +358,12 @@ class QuadWild:
             Files saved (when they exist)::
 
                 00_input.obj               — mesh sent to remeshAndField2
-                01_sharp.sharp             — sharp-feature file
-                02_remeshed.obj            — output of remeshAndField2
-                03_traced.obj              — output of trace2
-                04_quadrangulation.obj     — raw quadrangulation
-                05_quadrangulation_smooth.obj — after Laplacian smoothing
+                01_field.rosy              — optional precomputed orientation field
+                02_sharp.sharp             — sharp-feature file
+                03_remeshed.obj            — output of remeshAndField2
+                04_traced.obj              — output of trace2
+                05_quadrangulation.obj     — raw quadrangulation
+                06_quadrangulation_smooth.obj — after Laplacian smoothing
 
             Known differences vs. QRemeshify (Blender addon)
             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -426,6 +433,7 @@ class QuadWild:
             enable_preprocess=enable_preprocess,
             enable_sharp=enable_sharp,
             sharp_angle=sharp_angle,
+            field_path=field_path,
             enable_smoothing=enable_smoothing,
             scale_factor=scale_factor,
             fixed_chart_clusters=fixed_chart_clusters,
@@ -561,6 +569,7 @@ class QuadWild:
         enable_preprocess: bool,
         enable_sharp: bool,
         sharp_angle: float,
+        field_path: Optional[Union[str, Path]],
         enable_smoothing: bool,
         scale_factor: float,
         fixed_chart_clusters: int,
@@ -686,7 +695,7 @@ class QuadWild:
                 log.error(f"[preprocess] PyMeshLab failed: {e}. Returning original mesh.")
                 return m
 
-        def _call_stage1(obj_path, sharp_path, field_path):
+        def _call_stage1(obj_path, sharp_path, field_path, has_precomputed_field):
             """Call remeshAndField2 with the given parameters and file paths."""
             params = _Parameters(
                 remesh=enable_preprocess,
@@ -694,7 +703,7 @@ class QuadWild:
                 alpha=0.01,
                 scaleFact=1.0,
                 hasFeature=enable_sharp,
-                hasField=False,
+                hasField=has_precomputed_field,
             )
             try:
                 with _c_ctx():
@@ -831,7 +840,7 @@ class QuadWild:
             base       = str(tmpdir / "mesh")
             obj_path   = base + ".obj"
             sharp_path = base + "_rem.sharp"
-            field_path = base + "_rem.rosy"
+            temp_field_path = base + "_rem.rosy"
             remeshed_base = base + "_rem"
             traced_path   = base + "_rem_p0.obj"
             out_path      = base + "_rem_p0_0_quadrangulation.obj"
@@ -841,6 +850,16 @@ class QuadWild:
             log.info("[stage 0 / export]  wrote input OBJ → %s", obj_path)
             if debug_dir:
                 shutil.copy2(obj_path, debug_dir / "00_input.obj")
+
+            has_precomputed_field = field_path is not None
+            if has_precomputed_field:
+                source_field_path = Path(field_path)
+                if not source_field_path.is_file():
+                    raise QuadWildError(f"Precomputed field file not found: {source_field_path}")
+                shutil.copy2(source_field_path, temp_field_path)
+                log.info("[stage 0 / field]  using precomputed .rosy field → %s", source_field_path)
+                if debug_dir:
+                    shutil.copy2(temp_field_path, debug_dir / "01_field.rosy")
 
             if enable_sharp:
                 n_features = self._export_sharp(
@@ -852,13 +871,13 @@ class QuadWild:
                     n_features, sharp_angle,
                 )
                 if debug_dir:
-                    shutil.copy2(sharp_path, debug_dir / "01_sharp.sharp")
+                    shutil.copy2(sharp_path, debug_dir / "02_sharp.sharp")
             else:
                 n_features = 0
                 log.info("[stage 0 / sharp]  sharp detection disabled")
 
             log.info("[stages 1–3]  running C++ pipeline …")
-            _call_stage1(obj_path, sharp_path, field_path)
+            _call_stage1(obj_path, sharp_path, temp_field_path, has_precomputed_field)
 
             n_remeshed_verts = 0
             n_remeshed_faces = 0
@@ -884,17 +903,17 @@ class QuadWild:
             if remeshed_obj.is_file():
                 log.info("[stage 1]  remeshed mesh: vertices=%d  faces=%d", n_remeshed_verts, n_remeshed_faces)
                 if debug_dir:
-                    shutil.copy2(remeshed_obj, debug_dir / "02_remeshed.obj")
+                    shutil.copy2(remeshed_obj, debug_dir / "03_remeshed.obj")
             traced_obj = Path(traced_path)
             if traced_obj.is_file():
                 tv, tf = _count_obj_elements(traced_obj)
                 log.info("[stage 2]  traced mesh:   vertices=%d  faces=%d", tv, tf)
                 if debug_dir:
-                    shutil.copy2(traced_obj, debug_dir / "03_traced.obj")
+                    shutil.copy2(traced_obj, debug_dir / "04_traced.obj")
             if Path(out_path).is_file() and debug_dir:
-                shutil.copy2(out_path, debug_dir / "04_quadrangulation.obj")
+                shutil.copy2(out_path, debug_dir / "05_quadrangulation.obj")
             if Path(out_smooth).is_file() and debug_dir:
-                shutil.copy2(out_smooth, debug_dir / "05_quadrangulation_smooth.obj")
+                shutil.copy2(out_smooth, debug_dir / "06_quadrangulation_smooth.obj")
 
             result_path = out_smooth if (enable_smoothing and Path(out_smooth).is_file()) else out_path
 
